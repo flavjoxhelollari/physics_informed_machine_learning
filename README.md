@@ -16,3 +16,25 @@ Peter Battaglia, David Spergel, Shirley Ho, ICML Deep Differential Equations Wor
 Code: https://github.com/MilesCranmer/lagrangian_nns
 
 
+How to run the code from the 3 papers above? 
+
+git clone https://github.com/facebookresearch/jepa.git
+cd jepa
+pip install torch torchvision moviepy celluloid
+/absolute_file_path.[mp4, webvid, etc.] $integer_class_label
+python app/main.py --config-file configs/pretrain/your_config.yaml
+
+
+git clone https://github.com/greydanus/hamiltonian-nn.git
+cd hamiltonian-nn
+pip install torch numpy scipy matplotlib celluloid gym
+cd experiment/
+python experiment.py
+cd pixels/
+python pendulum.py
+
+
+
+git clone https://github.com/MilesCranmer/lagrangian_nns.git
+cd lagrangian_nns
+pip install jax jaxlib numpy moviepy celluloid
