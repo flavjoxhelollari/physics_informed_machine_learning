@@ -38,3 +38,12 @@ python pendulum.py
 git clone https://github.com/MilesCranmer/lagrangian_nns.git
 cd lagrangian_nns
 pip install jax jaxlib numpy moviepy celluloid
+
+
+Initial Report - Phase 1
+________________________
+
+Hamiltonian and Lagrangian Neural Networks for modeling pendulum dynamics
+
+
+
