@@ -46,3 +46,4 @@ This project demonstrates how physics-informed machine learning models—V-JEPA 
 
 
 **Note:** For detailed usage, see the source code and notebooks in each repository.
+For correspondence : flavjoxhelollari, pchristou
