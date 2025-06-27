@@ -96,11 +96,6 @@ def analyse_modes(
     with open(out_json, "w") as f:
         json.dump(metrics, f, indent=2)
     print("\nSaved metrics →", out_json)
-
-    # -------- save to json ---------------------------------------
-    with open(out_json, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print("\nSaved metrics →", out_json)
     
     
 # ------------------------------------------------------------
