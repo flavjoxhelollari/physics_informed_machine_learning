@@ -9,7 +9,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ────────────────────────────────────────────────────────────────
 # 0 · helper: run head → (θ̂, ω̂) and collect points
 # ────────────────────────────────────────────────────────────────
-def _scatter_head(model, head, dataset, num_samples=500, batch_size=64):
+def scatter_head(model, head, dataset, num_samples=500, batch_size=64):
     model.eval(); head.eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -65,7 +65,7 @@ def analyse_modes(modes,
         head.load_state_dict(torch.load(head_file, map_location=device))
 
         # --- collect points ------------------------------------------------
-        θ_t, ω_t, θ_p, ω_p = _scatter_head(model, head, dataset,
+        θ_t, ω_t, θ_p, ω_p = scatter_head(model, head, dataset,
                                            num_samples=samples)
 
         # --- metrics -------------------------------------------------------
@@ -252,27 +252,33 @@ def plot_metric(all_metrics, key, ylabel):
     plt.grid(axis="y"); plt.tight_layout(); plt.show()
     
     
-def _normalise_keys(ndict):
-    """map total→loss_total, jepa→loss_jepa, … if needed"""
-    mapping = {
-        "total":"loss_total", "jepa":"loss_jepa",
-        "hnn":"loss_hnn",     "lnn":"loss_lnn",
-        "sup":"loss_sup"
-    }
-    out = {}
-    for k,v in ndict.items():
-        out[ mapping.get(k,k) ] = v
-    return out
+# ─────────────────────────────────────────────────────────────
+# Tiny helper: normalise legacy vs. new key names
+# ─────────────────────────────────────────────────────────────
+REMAP = {          # legacy → new
+    "total": "loss_total",
+    "jepa" : "loss_jepa",
+    "hnn"  : "loss_hnn",
+    "lnn"  : "loss_lnn",
+    "sup"  : "loss_sup",
+}
 
-# ------------------------------------------------------------
-# 2)  Generic multi-line plot
-# ------------------------------------------------------------
-def plot_loss(comp, ylabel=None, logs= {}):
+def normalise_keys(d):
+    """Return a copy where old short names are mapped to loss_* names."""
+    return { REMAP.get(k, k): v for k, v in d.items() }
+  
+# ─────────────────────────────────────────────────────────────
+# Generic multi-run loss plotter
+# ─────────────────────────────────────────────────────────────
+def plot_loss(component_key, logs_dict, ylabel=None):
+    """
+    component_key : e.g. 'loss_total', 'loss_jepa', 'loss_hnn', …
+    """
     plt.figure(figsize=(7,4))
-    for mode,rec in logs.items():
-        if comp in rec:
-            plt.plot(rec[comp], label=mode)
+    for mode, rec in logs_dict.items():
+        if component_key in rec:
+            plt.plot(rec[component_key], label=mode)
     plt.xlabel("epoch")
-    plt.ylabel(ylabel or comp)
-    plt.title(f"{comp} across experiments")
+    plt.ylabel(ylabel or component_key)
+    plt.title(f"{component_key} across experiments")
     plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
