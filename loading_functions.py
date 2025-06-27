@@ -1,34 +1,57 @@
 import torch
+import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ----------------------------------------------------------------
-# Splitter that works for flat  **and**  prefixed checkpoints
-# ----------------------------------------------------------------
-def split_ckpt(path, map_location="cpu"):
+# ─────────────────────────────────────────────────────────────
+# 1 · Universal splitter
+# ─────────────────────────────────────────────────────────────
+def split_ckpt(model_path, theta_path=None, *, map_location="cpu"):
     """
-    Returns  vjepa_sd , theta_sd , hnn_sd , lnn_sd  (some may be None)
+    Return four state-dicts:
+        vjepa_sd   (dict)
+        theta_sd   (dict  or  None)
+        hnn_sd     (dict  or  None)
+        lnn_sd     (dict  or  None)
+    Works for *prefixed* as well as *flat* checkpoints.
     """
-    ckpt = torch.load(path, map_location=map_location)
 
-    # prefixed ⇒ strip prefixes ----------------------------------
+    ckpt = torch.load(model_path, map_location=map_location)
+
+    # ---------- Case A: prefixed combined dict -----------------
     if any(k.startswith("vjepa.") for k in ckpt):
-        vjepa_sd = {k[6:]  : v for k,v in ckpt.items() if k.startswith("vjepa.")}
-        theta_sd = {k[11:]: v for k,v in ckpt.items() if k.startswith("theta_head.")}
-        hnn_sd   = {k[4:]  : v for k,v in ckpt.items() if k.startswith("hnn.")} or None
-        lnn_sd   = {k[4:]  : v for k,v in ckpt.items() if k.startswith("lnn.")} or None
+        strip = lambda p, d: {k[len(p):]: v for k, v in d.items()
+                              if k.startswith(p)}
+        vjepa_sd = strip("vjepa.",       ckpt)
+        theta_sd = strip("theta_head.",  ckpt) or None
+        hnn_sd   = strip("hnn.",         ckpt) or None
+        lnn_sd   = strip("lnn.",         ckpt) or None
         return vjepa_sd, theta_sd, hnn_sd, lnn_sd
 
-    # flat ⇒ everything belongs to V-JEPA ------------------------
-    return ckpt, None, None, None
+    # ---------- Case B: flat dict ------------------------------
+    vjepa_sd, hnn_sd, lnn_sd = ckpt, None, None
 
+    if theta_path is None:
+        raise ValueError("theta_path required for flat checkpoints")
 
-def load_components(mode, suffix):
-    """load V-JEPA, theta-head and (optionally) HNN / LNN states"""
-    vjepa_sd, theta_sd, hnn_sd, lnn_sd = split_ckpt(f"model_{mode}{suffix}.pt")
+    if not os.path.exists(theta_path):
+        raise FileNotFoundError(theta_path)
 
-    # theta head saved separately in the current pipeline
-    if theta_sd is None:
-        theta_sd = torch.load(f"theta_{mode}{suffix}.pt", map_location="cpu")
-
+    theta_sd = torch.load(theta_path, map_location=map_location)
     return vjepa_sd, theta_sd, hnn_sd, lnn_sd
+
+
+# ─────────────────────────────────────────────────────────────
+# 2 · Convenience loader
+# ─────────────────────────────────────────────────────────────
+def load_components(mode, *, suffix="_dense", base_dir=".", map_location="cpu"):
+    """
+    Wrapper that calls `split_ckpt` with the correct paths.
+    """
+    model_path = os.path.join(base_dir, f"model_{mode}{suffix}.pt")
+    theta_path = os.path.join(base_dir, f"theta_{mode}{suffix}.pt")
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(model_path)
+
+    return split_ckpt(model_path, theta_path, map_location=map_location)

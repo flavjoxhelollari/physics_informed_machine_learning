@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.linear_model import LinearRegression
+from loading_functions import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -41,50 +42,64 @@ def scatter_head(model, head, dataset, num_samples=500, batch_size=64):
     return θ_t, ω_t, θ_p, ω_p
 
 
-# ────────────────────────────────────────────────────────────────
-# 1 · analyse & plot for all modes
-# ────────────────────────────────────────────────────────────────
-def analyse_modes(modes,
-                  dataset,
-                  model_ctor,
-                  head_ctor,
-                  samples=500,
-                  out_json="head_metrics_dense.json"):
+# ------------------------------------------------------------------
+# analyse_modes – now layout-agnostic
+# ------------------------------------------------------------------
+def analyse_modes(
+        modes,
+        dataset,
+        model_ctor,
+        head_ctor,
+        samples      = 500,
+        suffix       = "_dense",
+        model_dir    = "./models",        # <── NEW: where checkpoints live
+        out_json     = "head_metrics_dense.json"):
+
     metrics = {}
 
     for m in modes:
-        mdl_file  = f"model_{m}_dense.pt"
-        head_file = f"theta_{m}_dense.pt"
-        if not (os.path.exists(mdl_file) and os.path.exists(head_file)):
-            print(f"[{m}] checkpoints not found → skipping"); continue
+        try:
+            v_sd, t_sd, *_ = load_components(m, suffix=suffix, base_dir=model_dir)
+        except FileNotFoundError as e:
+            print(f"[{m}] {e}  →  skip"); continue
 
-        # --- load nets -----------------------------------------------------
+        # -------- instantiate nets ---------------------------------
         model = model_ctor().to(device)
-        model.load_state_dict(torch.load(mdl_file, map_location=device))
+        model.load_state_dict(v_sd, strict=True)
+
         head  = head_ctor().to(device)
-        head.load_state_dict(torch.load(head_file, map_location=device))
+        head.load_state_dict(t_sd, strict=True)
 
-        # --- collect points ------------------------------------------------
+        # -------- collect points -----------------------------------
         θ_t, ω_t, θ_p, ω_p = scatter_head(model, head, dataset,
-                                           num_samples=samples)
+                                          num_samples=samples)
 
-        # --- metrics -------------------------------------------------------
+        # -------- basic regress metrics ----------------------------
         r2θ  = r2_score(θ_t, θ_p);   mseθ = mean_squared_error(θ_t, θ_p)
         r2ω  = r2_score(ω_t, ω_p);   mseω = mean_squared_error(ω_t, ω_p)
+
         metrics[m] = dict(r2_theta=r2θ, mse_theta=mseθ,
                           r2_omega=r2ω, mse_omega=mseω)
-        print(f"\n{m.upper()}:  θ R²={r2θ:.3f}  ω R²={r2ω:.3f}")
 
-        # --- scatter plots -------------------------------------------------
+        print(f"\n{m.upper():8}  θ R²={r2θ:.3f}  ω R²={r2ω:.3f}  "
+              f"θ MSE={mseθ:.3e}  ω MSE={mseω:.3e}")
+
+        # -------- quick scatter plot --------------------------------
         plt.figure(figsize=(10,4))
         plt.subplot(1,2,1); plt.scatter(θ_t, θ_p, s=8, alpha=.6)
         plt.xlabel("true θ"); plt.ylabel("pred θ"); plt.grid()
         plt.subplot(1,2,2); plt.scatter(ω_t, ω_p, s=8, alpha=.6)
         plt.xlabel("true ω"); plt.ylabel("pred ω"); plt.grid()
-        plt.suptitle(f"Head predictions vs truth  –  {m}")
+        plt.suptitle(f"Latent head predictions vs truth — {m}")
         plt.tight_layout(); plt.show()
 
-    with open(out_json, "w") as f: json.dump(metrics, f, indent=2)
+    with open(out_json, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print("\nSaved metrics →", out_json)
+
+    # -------- save to json ---------------------------------------
+    with open(out_json, "w") as f:
+        json.dump(metrics, f, indent=2)
     print("\nSaved metrics →", out_json)
     
     
