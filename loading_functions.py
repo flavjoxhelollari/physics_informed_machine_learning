@@ -29,6 +29,7 @@ def split_ckpt(model_path, theta_path=None, *, map_location="cpu"):
         return vjepa_sd, theta_sd, hnn_sd, lnn_sd
 
     # ---------- Case B: flat dict ------------------------------
+    print("Loading flat checkpoint:", model_path)
     vjepa_sd, hnn_sd, lnn_sd = ckpt, None, None
 
     if theta_path is None:
