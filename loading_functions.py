@@ -26,6 +26,7 @@ def split_ckpt(model_path, theta_path=None, *, map_location="cpu"):
         theta_sd = strip("theta_head.",  ckpt) or None
         hnn_sd   = strip("hnn.",         ckpt) or None
         lnn_sd   = strip("lnn.",         ckpt) or None
+        print("Found prefixed checkpoint:", model_path)
         return vjepa_sd, theta_sd, hnn_sd, lnn_sd
 
     # ---------- Case B: flat dict ------------------------------
