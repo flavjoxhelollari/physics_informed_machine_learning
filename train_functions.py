@@ -6,13 +6,14 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from tqdm import tqdm
 import numpy as np
+import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ================================================================
 # 0 · helper: train ONE epoch, return loss dict
 # ================================================================
-def _train_one_epoch(model, theta_head, lnn, hnn,
+def train_one_epoch(model, theta_head, lnn, hnn,
                      loader, opt, λ_lnn, λ_hnn, λ_sup):
     
     model.train(); theta_head.train()
@@ -66,26 +67,27 @@ def _train_one_epoch(model, theta_head, lnn, hnn,
 # ================================================================
 # 1 · run one MODE and save log
 # ================================================================
-def run_mode(mode:str, dataset, dataloader, epochs:int=10, batch_size:int=32, suffix = '_dense'):
-    print(f"\n###  {mode.upper()}  ###")
+def run_mode(
+        mode       : str,
+        dataloader,
+        lambda_map,
+        *,
+        epochs     = 10,
+        batch_size = 32,
+        suffix     = "_dense",
+        model_dir  = "./models",     # ← NEW: where to save *.pt
+        log_dir    = "./results_numpy"):   # ← NEW: where to save *.npz
 
-    SUFFIX = suffix
-    
-    # ---- hyper-params specific to run -------------------------
-    λ_map = {
-        "plain":    dict(λ_h=0.0,   λ_l=0.0),
-        "hnn":      dict(λ_h=1e-3,  λ_l=0.0),
-        "lnn":      dict(λ_h=0.0,   λ_l=1e-3),
-        "hnn+lnn":  dict(λ_h=5e-4,  λ_l=1e-3),
-    }
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(log_dir,   exist_ok=True)
+    print(f"\n###  {mode.upper()}  (saving to {model_dir})  ###")
+
+    # ── hyper-parameters per mode ───────────────────────────────
+    λ_map = lambda_map
     λ_h, λ_l = λ_map[mode]["λ_h"], λ_map[mode]["λ_l"]
-    λ_sup = 1e-2
+    λ_sup    = 1e-2
 
-    # ---- data loader ------------------------------------------
-    ds = dataset
-    dl = dataloader
-
-    # ---- networks ---------------------------------------------
+    # ── networks ───────────────────────────────────────────────
     model       = VJEPA(embed_dim=384, depth=6, num_heads=6).to(device)
     theta_head  = nn.Linear(384, 2).to(device)
     hnn         = HNN(hidden_dim=256).to(device) if λ_h > 0 else None
@@ -96,50 +98,46 @@ def run_mode(mode:str, dataset, dataloader, epochs:int=10, batch_size:int=32, su
     if lnn: params += list(lnn.parameters())
     opt = optim.AdamW(params, lr=1e-4)
 
-    # ---- training ---------------------------------------------
-    log = {k:[] for k in ["total","jepa","hnn","lnn","sup"]}
+    # ── training loop ──────────────────────────────────────────
+    log = {k: [] for k in ["loss_total", "loss_jepa",
+                           "loss_hnn",  "loss_lnn", "loss_sup"]}
+
     for ep in range(epochs):
-        ep_loss = _train_one_epoch(model, theta_head, lnn, hnn,
-                                   dl, opt, λ_l, λ_h, λ_sup)
-        for k in log: log[k].append(ep_loss[k])
-        print(f"ep {ep+1}: tot {ep_loss['total']:.3f} "
-              f"j {ep_loss['jepa']:.3f} "
-              f"h {ep_loss['hnn']:.3f} "
+        ep_loss = train_one_epoch(model, theta_head, lnn, hnn,
+                                  dataloader, opt, λ_l, λ_h, λ_sup)
+        for k_new, k_old in zip(log.keys(),
+                                ["total", "jepa", "hnn", "lnn", "sup"]):
+            log[k_new].append(ep_loss[k_old])
+
+        print(f"ep {ep+1:02d}: "
+              f"tot {ep_loss['total']:.3f}  "
+              f"j {ep_loss['jepa']:.3f}  "
+              f"h {ep_loss['hnn']:.3f}  "
               f"l {ep_loss['lnn']:.3f}")
 
-    # ---- save dictionary --------------------------------------
-    cfg = dict(mode=mode, epochs=epochs,
-               λ_hnn=λ_h, λ_lnn=λ_l, λ_sup=λ_sup,
-               batch_size=batch_size)
-    # ---------------------------------------------------------------
-    # replace the two separate torch.save(...) calls by this block
-    # ---------------------------------------------------------------
+    # ── build single combined checkpoint ───────────────────────
     full_sd = {}
 
-    # 1)  V-JEPA backbone
     for k, v in model.state_dict().items():
         full_sd[f"vjepa.{k}"] = v.cpu()
-
-    # 2)  θ-ω linear head
     for k, v in theta_head.state_dict().items():
         full_sd[f"theta_head.{k}"] = v.cpu()
-
-    # 3)  HNN parameters  (only if this mode uses an HNN)
-    if hnn is not None:
+    if hnn:
         for k, v in hnn.state_dict().items():
             full_sd[f"hnn.{k}"] = v.cpu()
-
-    # 4)  LNN parameters  (only if this mode uses an LNN)
-    if lnn is not None:
+    if lnn:
         for k, v in lnn.state_dict().items():
             full_sd[f"lnn.{k}"] = v.cpu()
 
-    # ---- one self-contained checkpoint ----
-    torch.save(full_sd, f"model_{mode}{SUFFIX}.pt")
+    ckpt_path = os.path.join(model_dir, f"model_{mode}{suffix}.pt")
+    torch.save(full_sd, ckpt_path)
+    print("checkpoint saved →", ckpt_path)
 
-    # --------- training log stays unchanged ----------
-    np.savez(f"results_{mode}{SUFFIX}.npz", **log, config=cfg)
-    print(f"saved to  model_{mode}{SUFFIX}.pt   &   results_{mode}{SUFFIX}.npz")
-    
-    np.savez(f"results_{mode}_dense.npz", **log, config=cfg)
-    print("saved to results_%s_dense.npz" % mode)
+    # ── save training curves ───────────────────────────────────
+    cfg = dict(mode=mode, epochs=epochs,
+               λ_hnn=λ_h, λ_lnn=λ_l, λ_sup=λ_sup,
+               batch_size=batch_size)
+
+    log_path = os.path.join(log_dir, f"results_{mode}{suffix}.npz")
+    np.savez(log_path, **log, config=cfg)
+    print("training log saved →", log_path)
