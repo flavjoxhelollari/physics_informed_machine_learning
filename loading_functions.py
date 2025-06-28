@@ -1,5 +1,6 @@
 import torch
 import os
+from models import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -57,3 +58,36 @@ def load_components(mode, *, suffix="_dense", base_dir=".", map_location="cpu"):
         raise FileNotFoundError(model_path)
 
     return split_ckpt(model_path, theta_path, map_location=map_location)
+
+# -----------------------------------------------------------
+# Revised load_net – now directory-aware
+# -----------------------------------------------------------
+def load_net(mode: str,
+             *,                       # keyword-only args
+             suffix    = "_dense",
+             model_dir = ".",         # ← new
+             map_location = "cpu"):
+
+    # 1) grab four state-dicts via the robust helper
+    v_sd, t_sd, hnn_sd, lnn_sd = load_components(
+        mode,
+        suffix       = suffix,
+        base_dir     = model_dir,
+        map_location = map_location
+    )
+
+    # 2) instantiate modules
+    vjepa = VJEPA(embed_dim=384, depth=6, num_heads=6).to(device)
+    head  = torch.nn.Linear(384, 2).to(device)
+    vjepa.load_state_dict(v_sd, strict=True)
+    head.load_state_dict(t_sd, strict=True)
+
+    hnn = lnn = None
+    if hnn_sd:
+        hnn = HNN(hidden_dim=256).to(device)
+        hnn.load_state_dict(hnn_sd, strict=True)
+    if lnn_sd:
+        lnn = LNN(input_dim=2, hidden_dim=256).to(device)
+        lnn.load_state_dict(lnn_sd, strict=True)
+
+    return vjepa, head, hnn, lnn

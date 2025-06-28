@@ -3,7 +3,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.linear_model import LinearRegression
+
 from loading_functions import *
+from evaluation_metrics import *
+from helper_functions import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -292,3 +295,45 @@ def plot_loss(component_key, logs_dict, ylabel=None):
     plt.ylabel(ylabel or component_key)
     plt.title(f"{component_key} across experiments")
     plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+
+
+
+# ------------------------------------------------------------------
+# Evaluate a single mode and save metrics
+# ------------------------------------------------------------------
+def evaluate_mode(
+        mode: str,
+        eval_loader,
+        *,
+        horizon, dt, m , g, l,                  # ← REQUIRED
+        suffix    ="_dense",
+        model_dir ="./models",
+        out_dir   ="./metrics"):
+
+    # build & load
+    vjepa, head, hnn, lnn = load_net(
+        mode,
+        suffix    = suffix,
+        model_dir = model_dir
+    )
+
+    # roll out
+    θ, ω, _ = rollout(vjepa, head,
+                      hnn=hnn, lnn=lnn,
+                      horizon=horizon, dt=dt,
+                      eval_loader=eval_loader)
+
+    # metrics
+    out = {
+        "Δ_div"  : neighbour_divergence(θ, ω),
+        "E_drift": energy_drift(θ, ω, m=m, g=g, l=l),
+    }
+    if lnn is not None:
+        out["EL_res"] = el_residual_metric(lnn, θ, ω, dt=dt)
+
+    # save
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"metrics_{mode}{suffix}.json")
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"{mode:8} →", out, f"(saved → {out_path})")

@@ -75,102 +75,79 @@ def plot_true_phase_space(dataset, num_samples=500):
     plt.show()
     
     
-# -------------------------------------------------------------
-# 4.Stable LNN acceleration helper (single grad w.r.t. qv)
-# -------------------------------------------------------------
-def lnn_accel(lnn, q, v, dt=None, eps=1e-6, a_clip=25.0):
+# ------------------------------------------------------------------
+# Stable LNN acceleration helper
+# ------------------------------------------------------------------
+def lnn_accel(lnn, q, v, *, dt, eps=1e-6, a_clip=25.0):
     """
-    Stable acceleration from a learned Lagrangian NN
-      a = ( d/dt ∂L/∂v  –  ∂L/∂q )  /  ∂²L/∂v²
-    q, v : (B,)   – 1-D tensors of θ and ω
-    returns a : (B,)  – predicted ω̇
+    a = ( d/dt ∂L/∂v  –  ∂L/∂q ) / ∂²L/∂v²
+    q, v : (B,) – tensors (no grads required on entry)
     """
-    # ---------------------------------------------
-    # 1) build (q,v) with grad tracking
-    # ---------------------------------------------
-    qv = torch.stack([q, v], dim=1).requires_grad_(True)   # (B,2)
+    qv = torch.stack([q, v], 1).requires_grad_(True)  # (B,2)
 
-    # ---------------------------------------------
-    # 2) L(q,v)  and first derivatives
-    # ---------------------------------------------
-    L = lnn(qv).sum()
-    dLdqv = torch.autograd.grad(L, qv, create_graph=True)[0]  # (B,2)
-    dLdq, dLdv = dLdqv[:, 0], dLdqv[:, 1]                     # (B,)
+    L        = lnn(qv).sum()
+    dLdqv    = torch.autograd.grad(L, qv, create_graph=True)[0]
+    dLdq, dLdv = dLdqv[:, 0], dLdqv[:, 1]
 
-    # time derivative  d/dt ∂L/∂v  ~  (current − stop-grad) / dt
-    dLdv_dt = (dLdv - dLdv.detach()) / dt                    # (B,)
+    dLdv_dt  = (dLdv - dLdv.detach()) / dt
+    d2Ldv2   = torch.autograd.grad(dLdv.sum(), qv,
+                                   create_graph=True)[0][:, 1]
 
-    # ---------------------------------------------
-    # 3) second derivative  ∂²L/∂v²   (diagonal entry)
-    # ---------------------------------------------
-    d2Ldv2 = torch.autograd.grad(dLdv.sum(), qv,
-                                 create_graph=True)[0][:, 1] # (B,)
+    denom    = d2Ldv2.abs().clamp_min(eps) * d2Ldv2.sign()
+    a_pred   = (dLdv_dt - dLdq) / denom
+    return a_pred.clamp(-a_clip, a_clip)
 
-    # clamp denominator to avoid division blow-up
-    denom = d2Ldv2.abs().clamp_min(eps) * d2Ldv2.sign()      # preserve sign
 
-    # ---------------------------------------------
-    # 4) acceleration  and optional clipping
-    # ---------------------------------------------
-    a_pred = (dLdv_dt - dLdq) / denom                        # (B,)
-    if a_clip is not None:
-        a_pred = a_pred.clamp(-a_clip, a_clip)
+# ------------------------------------------------------------------
+# Roll-out latent phase trajectory
+# ------------------------------------------------------------------
 
-    return a_pred
+@torch.no_grad()
+def rollout(vjepa, head, *,                    # pos-only before *
+            hnn=None, lnn=None,
+            horizon, dt,                       # ← REQUIRED
+            eval_loader):
 
-# ----------------------------------------------------------------
-# 5 · rollout latent phase trajectory
-# ----------------------------------------------------------------
-@torch.no_grad()                         
-def rollout(vjepa, head, *, hnn=None, lnn=None, horizon=None, dt=None, eval_loader=None):
-    """
-    Returns three tensors θ, ω, α  of shape (N,T).
+    if horizon is None or dt is None:
+        raise ValueError("rollout: ‘horizon’ and ‘dt’ must be supplied")
 
-    α = learned angular acceleration (zeros if neither HNN nor LNN is used)
-    """
     vjepa.eval(); head.eval()
     if hnn: hnn.eval()
     if lnn: lnn.eval()
 
-    θ_list, ω_list, α_list = [], [], []
-    for seq, _ in tqdm(eval_loader, desc="rollout", leave=False):
+    θ_buf, ω_buf, α_buf = [], [], []
+
+    for seq, _ in tqdm.tqdm(eval_loader, desc="rollout", leave=False):
         imgs0 = seq[:, 0].to(device)
+        z0    = vjepa.context_encoder(
+                    vjepa.patch_embed(imgs0) + vjepa.pos_embed).mean(1)
+        θ, ω  = head(z0).split(1, 1)
+        θ, ω  = θ.squeeze(), ω.squeeze()
 
-        # -- initial latent → (θ̂₀, ω̂₀) ---------------------------
-        z0        = vjepa.context_encoder(
-                        vjepa.patch_embed(imgs0) + vjepa.pos_embed).mean(1)
-        θ0, ω0    = head(z0).split(1, 1)           # (B,1) each
-        θs, ωs    = [θ0.squeeze()], [ω0.squeeze()]
-        αs        = []                             # will pad later
+        Θ, Ω, Α = [θ], [ω], []
 
-        # -- roll out ---------------------------------------------
         for _ in range(horizon - 1):
-            q, v = θs[-1].detach(), ωs[-1].detach()
+            q, v = Θ[-1].detach(), Ω[-1].detach()
 
-            # enable grads ONLY for the physics net we need
             if hnn is not None:
                 with torch.set_grad_enabled(True):
-                    qp   = torch.stack([q, v], 1).requires_grad_(True)
-                    a    = hnn.time_derivative(qp)[:, 1]          # dp/dt
+                    qp = torch.stack([q, v], 1).requires_grad_(True)
+                    α  = hnn.time_derivative(qp)[:, 1]
             elif lnn is not None:
                 with torch.set_grad_enabled(True):
-                    a    = lnn_accel(lnn, q, v, dt)               # from LNN
+                    α  = lnn_accel(lnn, q, v, dt=dt)
             else:
-                a = torch.zeros_like(v)                           # plain V-JEPA
+                α = torch.zeros_like(v)
 
-            q_next = q + v * dt
-            v_next = v + a * dt
+            Θ.append(q + v * dt)
+            Ω.append(v + α * dt)
+            Α.append(α)
 
-            θs.append(q_next); ωs.append(v_next); αs.append(a)
+        Α = [torch.zeros_like(Α[0])] + Α
+        θ_buf.append(torch.stack(Θ, 1))
+        ω_buf.append(torch.stack(Ω, 1))
+        α_buf.append(torch.stack(Α, 1))
 
-        # pad α with a zero for t = 0
-        αs = [torch.zeros_like(αs[0])] + αs
-
-        θ_list.append(torch.stack(θs, 1))
-        ω_list.append(torch.stack(ωs, 1))
-        α_list.append(torch.stack(αs, 1))
-
-    θ = torch.cat(θ_list, 0).cpu()
-    ω = torch.cat(ω_list, 0).cpu()
-    α = torch.cat(α_list, 0).cpu()
-    return θ, ω, α        # each (N, T)
+    return (torch.cat(θ_buf).cpu(),
+            torch.cat(ω_buf).cpu(),
+            torch.cat(α_buf).cpu())

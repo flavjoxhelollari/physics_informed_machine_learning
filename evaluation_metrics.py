@@ -19,7 +19,7 @@ def neighbour_divergence(θ, ω, ε=0.1, step=-1):
     return diff.norm(dim=1).mean().item()
 
 
-def energy_drift(θ, ω, m, g, l):
+def energy_drift(θ, ω, m=1, g=9.8, l=1):
     E0 = 0.5 * m * (l ** 2) * ω[:, 0] ** 2 + m * g * l * (1 - torch.cos(θ[:, 0]))
     Et = 0.5 * m * (l ** 2) * ω[:, -1] ** 2 + m * g * l * (1 - torch.cos(θ[:, -1]))
     return (Et - E0).abs().mean().item()
@@ -30,11 +30,11 @@ def accel_mse(θ, alpha_pred, m, g, l):
     return F.mse_loss(alpha_pred[:, :-1], alpha_true).item()
 
 
-def el_residual_metric(lnn, θ, ω, DT):
+def el_residual_metric(lnn, θ, ω, dt):
     q = θ[:, :3, None]       # (N,3,1)
     v = ω[:, :3, None]
     return lnn.lagrangian_residual(q.to(device),
-                                   v.to(device), DT).item()
+                                   v.to(device), dt).item()
 
 
 def latent_R2(vjepa, head, n_samples=500, eval_loader=None):
