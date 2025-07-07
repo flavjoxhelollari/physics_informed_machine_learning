@@ -140,86 +140,102 @@ def head_regression_metrics(
 
 
 # ====================================================================
-# 4 · Evaluate a single mode
+# 4 · Evaluate ONE mode  ––  **now aware of `combine`**
 # ====================================================================
 def evaluate_mode(
-    mode: str,
+    mode       : str,
     dataset,
-    cfg:  EvalConfig,
+    cfg        : EvalConfig,
     *,
-    plot_head_scatter: bool = False
+    combine            : str | tuple[str, float] | None = None,  # ← NEW
+    plot_head_scatter  : bool = False
 ) -> Dict[str, float]:
     """
-    Full inference pipeline for *one* checkpoint.
+    Run inference for a single checkpoint (plain, hnn, lnn, hnn+lnn).
 
-    Steps
-    -----
-    1. Locate and load `model_<mode><suffix>.pt`
-    2. Instantiate VJEPA (+ HNN / LNN if present)
-    3. Roll out latent phase space for `cfg.horizon` steps
-    4. Compute physics metrics (Δ_div, E_drift, EL_res)
-    5. Optionally draw head-scatter + regression metrics
-    6. Save metrics JSON into `cfg.out_dir`
+    Parameters
+    ----------
+    mode
+        Which checkpoint to load (plain / hnn / lnn / hnn+lnn).
+    dataset
+        Evaluation dataset (must yield tensors on CPU).
+    cfg
+        Shared :class:`EvalConfig` with horizon, dt, dirs…
+    combine
+        *Only* relevant when the checkpoint **contains both** physics nets
+        (i.e. *hnn+lnn* run):
+
+        ================  ============================================
+        ``None``          → use *HNN only* (silently ignore LNN)  
+        ``"mean"``        → α = ½(α_HNN + α_LNN)  
+        ``"sum"``         → α = α_HNN + α_LNN  
+        ``("blend", w)``  → α = w·α_HNN + (1‒w)·α_LNN (0 ≤ w ≤ 1)  
+        ================  ============================================
+
+    plot_head_scatter
+        If *True*, show θ/ω scatter­plots.
 
     Returns
     -------
-    Dict[str, float] – the same dict that gets written to disk.
+    Dict[str, float]
+        Physics metrics + latent-head regression diagnostics.
     """
-    # ---------- 1) state-dicts (works for flat OR prefixed) ----------
+    # 1) -------- load raw state-dicts (flat or prefixed) ------------
     v_sd, t_sd, hnn_sd, lnn_sd = load_components(
         mode, suffix=cfg.suffix, base_dir=cfg.model_dir)
 
-    # ---------- 2) build nets & load weights ------------------------
+    # 2) -------- recreate modules & load weights --------------------
     model = VJEPA(embed_dim=384, depth=6, num_heads=6).to(device)
     head  = torch.nn.Linear(384, 2).to(device)
     model.load_state_dict(v_sd, strict=True)
-    head.load_state_dict(t_sd, strict=True)
+    head .load_state_dict(t_sd, strict=True)
 
     hnn = lnn = None
-    if hnn_sd:                                     # HNN present in ckpt?
+    if hnn_sd:
         hnn = HNN(hidden_dim=256).to(device)
         hnn.load_state_dict(hnn_sd, strict=True)
-    if lnn_sd:                                     # LNN present in ckpt?
+    if lnn_sd:
         lnn = LNN(input_dim=2, hidden_dim=256).to(device)
         lnn.load_state_dict(lnn_sd, strict=True)
 
-    # ---------- 3) deterministic evaluation loader -----------------
+    # 3) -------- deterministic evaluation loader -------------------
     eval_loader = DataLoader(dataset, batch_size=64, shuffle=False)
 
-    # rollout latent trajectory
+    # 4) -------- latent roll-out (passes `combine`) -----------------
     θ, ω, _ = rollout(model, head,
-                      hnn=hnn, lnn=lnn,
-                      horizon=cfg.horizon,
-                      dt=cfg.dt,
-                      eval_loader=eval_loader)
+                      hnn           = hnn,
+                      lnn           = lnn,
+                      combine       = combine,
+                      horizon       = cfg.horizon,
+                      dt            = cfg.dt,
+                      eval_loader   = eval_loader)
 
-    # ---------- 4) physics metrics ---------------------------------
+    # 5) -------- physics metrics ------------------------------------
     metrics = {
         "Δ_div"  : neighbour_divergence(θ, ω),
         "E_drift": energy_drift(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l),
     }
-    if lnn is not None:
+    if lnn is not None:                                   # ← now unconditional
         metrics["EL_res"] = el_residual_metric(lnn, θ, ω, dt=cfg.dt)
 
-    # ---------- 5) latent-head scatter -----------------------------
+    # 6) -------- latent-head diagnostics ----------------------------
     θ_t, ω_t, θ_p, ω_p = collect_head_scatter(
         model, head, dataset,
-        n_samples=cfg.scatter_samples,
-        batch=cfg.scatter_batch)
+        n_samples = cfg.scatter_samples,
+        batch     = cfg.scatter_batch)
 
     metrics.update(head_regression_metrics(θ_t, ω_t, θ_p, ω_p))
 
-    # optional quick plot
     if plot_head_scatter:
         plt.figure(figsize=(10,4))
         plt.subplot(1,2,1); plt.scatter(θ_t, θ_p, s=8, alpha=.6)
         plt.xlabel("true θ"); plt.ylabel("pred θ"); plt.grid()
         plt.subplot(1,2,2); plt.scatter(ω_t, ω_p, s=8, alpha=.6)
         plt.xlabel("true ω"); plt.ylabel("pred ω"); plt.grid()
-        plt.suptitle(f"Head predictions vs truth — {mode}")
+        plt.suptitle(f"Head predictions vs truth – {mode}")
         plt.tight_layout(); plt.show()
 
-    # ---------- 6) write JSON --------------------------------------
+    # 7) -------- save per-mode JSON ---------------------------------
     os.makedirs(cfg.out_dir, exist_ok=True)
     out_path = os.path.join(cfg.out_dir, f"metrics_{mode}{cfg.suffix}.json")
     with open(out_path, "w") as f:
@@ -230,38 +246,102 @@ def evaluate_mode(
 
 
 # ====================================================================
-# 5 · Evaluate a list of modes
+# 5 · Evaluate *many* modes (auto-detects whether fusion is possible)
 # ====================================================================
 def evaluate_all_modes(
-    modes  : Iterable[str],
+    modes        : Iterable[str],
     dataset,
-    cfg    : EvalConfig
+    cfg          : EvalConfig,
+    *,
+    combine      : str | tuple[str, float] | None = "mean",
+    plot_scatter : bool = False,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Loop `evaluate_mode` over `modes`; combine into one JSON.
+    Run :func:`evaluate_mode` for every string in *modes*.
+
+    The helper **checks each checkpoint first** and forwards the *combine*
+    argument **only when *both* physics nets are present** (otherwise the
+    call falls back to ``combine=None`` so that the run is *not* skipped).
+
+    Parameters
+    ----------
+    modes
+        Iterable with any subset of ``{"plain","hnn","lnn","hnn+lnn"}``.
+    dataset
+        Evaluation dataset (e.g. deterministic Pendulum grid).
+    cfg
+        Shared :class:`EvalConfig` (horizon, dt, paths…).
+    combine
+        Fusion rule when *both* HNN **and** LNN exist in the checkpoint
+        (ignored otherwise).  Supported values:
+
+        ================  ============================================
+        ``None``          do **not** fuse – use HNN alone  
+        ``"mean"``        α = ½ (α_HNN + α_LNN)  ← **default**  
+        ``"sum"``         α = α_HNN + α_LNN  
+        ``("blend", w)``  α = w·α_HNN + (1-w)·α_LNN  (0 ≤ w ≤ 1)  
+        ================  ============================================
+
+    plot_scatter
+        Forwarded to :func:`evaluate_mode(plot_head_scatter=…)`.
+
+    Returns
+    -------
+    dict
+        ``{mode: metric-dict}`` for every *successfully* evaluated mode.
+        The same object is also written as JSON to
+        ``cfg.out_dir / metrics_all<suffix>.json``.
     """
     all_metrics: Dict[str, Dict[str, float]] = {}
 
-    for m in modes:
+    for mode in modes:
         try:
-            all_metrics[m] = evaluate_mode(m, dataset, cfg)
-        except FileNotFoundError as e:
-            print(f"[{m}] {e}")
+            # --- lightweight peek: are both physics nets stored? ----
+            _, _, hnn_sd, lnn_sd = load_components(
+                mode,
+                suffix       = cfg.suffix,
+                base_dir     = cfg.model_dir,
+                map_location = "cpu")               # tiny, no GPU alloc
 
-    # save combined
+            # decide on the fusion rule to pass downstream
+            comb_arg = combine if (hnn_sd and lnn_sd) else None
+
+            # ------------------ full evaluation --------------------
+            all_metrics[mode] = evaluate_mode(
+                mode,
+                dataset,
+                cfg,
+                combine           = comb_arg,
+                plot_head_scatter = plot_scatter
+            )
+        except FileNotFoundError as err:
+            print(f"[{mode}] skipped – checkpoint not found: {err}")
+        except ValueError as err:
+            # propagate unexpected errors but keep loop alive
+            print(f"[{mode}] skipped – {err}")
+
+    # ------------------ persist combined dict -----------------------
     os.makedirs(cfg.out_dir, exist_ok=True)
-    combined = os.path.join(cfg.out_dir, f"metrics_all{cfg.suffix}.json")
-    with open(combined, "w") as f:
-        json.dump(all_metrics, f, indent=2)
-    print("\nCombined metrics →", combined)
-    return all_metrics
+    out_file = os.path.join(cfg.out_dir, f"metrics_all{cfg.suffix}.json")
+    with open(out_file, "w") as fh:
+        json.dump(all_metrics, fh, indent=2)
 
+    print(f"\n✓ combined metrics saved → {out_file}")
+    return all_metrics
 
 # ====================================================================
 # 6 · Legacy plotting helpers
 # ====================================================================
 _REMAP = {"total":"loss_total","jepa":"loss_jepa",
           "hnn":"loss_hnn","lnn":"loss_lnn","sup":"loss_sup"}
+
+metrics_to_plot: list[tuple[str, str]] = [
+    ("loss_total", "total objective"),
+    ("loss_hnn",   "HNN residual"),
+    ("loss_lnn",   "LNN residual"),
+    ("loss_jepa",  "JEPA reconstruction"),
+    ("loss_sup",   "θ supervision"),
+]
 
 def normalise_keys(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """Map legacy keys (total/jepa/…) → new loss_* names."""
@@ -289,3 +369,27 @@ def plot_loss(
     plt.ylabel(ylabel or component)
     plt.title(component)
     plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+    
+def plot_selected_losses(
+    logs: Dict[str, Dict[str, np.ndarray]],
+    *,
+    items: list[tuple[str, str]] = metrics_to_plot
+) -> None:
+    """
+    Iterate over `items` and draw a loss curve **only if** at least one
+    run in `logs` contains the given key.
+
+    Parameters
+    ----------
+    logs
+        Dict mapping *mode* → dict of numpy arrays
+        (already passed through `normalise_keys` if needed).
+    items
+        Sequence of ``(loss_key, y-label)`` tuples.  Defaults to the
+        canonical list above.
+    """
+    for key, label in items:
+        if any(key in rec for rec in logs.values()):  # at least one run has it?
+            plot_loss(key, logs, ylabel=label)        # use the existing helper
+        else:
+            print(f"[skip] no log contains '{key}'")

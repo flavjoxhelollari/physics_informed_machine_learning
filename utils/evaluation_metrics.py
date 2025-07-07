@@ -41,7 +41,6 @@ import numpy as np                          # reference math
 from sklearn.linear_model  import LinearRegression
 from sklearn.metrics       import r2_score, mean_squared_error
 from typing                 import Dict, Tuple
-
 # ---------------------------------------------------------------------
 # Physical defaults (override via function kwargs for other setups)
 # ---------------------------------------------------------------------
