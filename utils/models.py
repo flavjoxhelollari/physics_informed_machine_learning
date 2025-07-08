@@ -396,34 +396,36 @@ class LNN(nn.Module):
     # -----------------------------------------------------------------
     def lagrangian_residual(
         self,
-        q: torch.Tensor,          # (B, T, d)
-        v: torch.Tensor,          # (B, T, d)
-        dt: float = 1e-2,
+        q : torch.Tensor,      # (B,T,d)
+        v : torch.Tensor,      # (B,T,d)
+        dt: float = 0.01,
+        *,                     # ← kw-only from here
+        per_time_step: bool = False   # NEW
     ) -> torch.Tensor:
         """
-        Compute mean-squared Euler–Lagrange residual across time.
+        Euler–Lagrange residual.
 
-        Implementation follows the original paper (`d/dt` via
-        first-order finite differences on **∂L/∂v**).
-
-        Returns a **scalar** tensor (ready for `loss.backward()`).
+        Parameters
+        ----------
+        per_time_step
+            *False* (default) → return scalar mean over (B,T-1,d)  
+            *True*            → return tensor (B,T-1)   (mean over d)
         """
         B, T, d = q.shape
-        # build differentiable batch with leading time dimension flattened
-        z = torch.cat([q, v], -1).reshape(B * T, -1).requires_grad_(True)
-        L = self.forward(z).sum()                              # scalar
+        z  = torch.cat([q, v], -1).reshape(B*T, -1).requires_grad_(True)
+        L  = self.forward(z).sum()
 
-        dLd = torch.autograd.grad(L, z, create_graph=True)[0]  # (B·T, 2d)
-        dLdq, dLdv = dLd.split(d, dim=-1)                      # each (B·T, d)
-
-        # reshape back to (B, T, d)
+        dLd = torch.autograd.grad(L, z, create_graph=True)[0]
+        dLdq, dLdv = dLd.split(d, -1)
         dLdq = dLdq.view(B, T, d)
         dLdv = dLdv.view(B, T, d)
 
-        # forward finite difference for time-derivative
-        d_dt_dLdv = (dLdv[:, 1:] - dLdv[:, :-1]) / dt          # (B, T−1, d)
-        residual  = d_dt_dLdv - dLdq[:, :-1]                  # Euler–Lagrange
-        return (residual ** 2).mean()
+        d_dt_dLdv = (dLdv[:, 1:] - dLdv[:, :-1]) / dt        # (B,T-1,d)
+        res       = d_dt_dLdv - dLdq[:, :-1]                 # Euler–Lagrange
+
+        if per_time_step:                                   # curve wanted
+            return res.pow(2).mean(-1)                      # (B,T-1)
+        return res.pow(2).mean()  
 
 
 # ---------------------------------------------------------------------
