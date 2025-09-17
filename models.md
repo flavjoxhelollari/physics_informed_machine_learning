@@ -466,54 +466,178 @@ With these explanations you now know **exactly** how masks are generated,
 how they flow through the twin encoders and predictor, and where to hook
 in modifications without breaking tensor shapes or broadcast semantics.
 
-## 5 · `LNN` – minimal Lagrangian NN (lines 250-301)
+---
 
-* Network body: **MLP(2→hidden→hidden→1)** with tanh activations.  
-  Input is `(q, v)` where `q=θ`, `v=ω` → 2 numbers → scalar **L**.
+## 5 · `LNN` — minimal *Lagrangian* neural network  
+*Based on Cranmer et al. 2020, adapted to a 1-DoF pendulum (`d = 1`).*
 
-* **`lagrangian_residual`** (273-300)  
-  *Purpose:* compute the Euler–Lagrange residual ‖d/dt (∂L/∂v) − ∂L/∂q‖².  
-  *Key tricks:*  
-  * **Automatic differentiation** over **all time steps at once** by concatenating them (`z.reshape(B*T, -1)`).  
-  * `create_graph=True` keeps second-order grads so you can back-prop through the residual into network weights.  
-  * Optional `per_time_step=True` returns a curve (useful for plotting how physics violation evolves).
+### 5.0  Constructor (lines 250-268)
+```python
+250 class LNN(nn.Module):
+...
+266     def __init__(self, input_dim: int, hidden_dim: int = 256) -> None:
+268         self.net = nn.Sequential(
+269             nn.Linear(input_dim, hidden_dim),
+270             nn.Tanh(),
+271             nn.Linear(hidden_dim, hidden_dim),
+272             nn.Tanh(),
+273             nn.Linear(hidden_dim, 1),
+274         )
+```
+*Lines 268-274*  Two hidden layers → scalar output **L(q,v)**.  
+**Choice rationale**  
+
+| Parameter | Default | Why |
+|-----------|---------|-----|
+| `input_dim = 2d` | 2 for 1-DoF pendulum | Works unmodified for multi-DoF. |
+| `hidden_dim = 256` | Empirically large enough for smooth L surfaces; small enough to keep 2nd-order grads affordable. |
+| `Tanh` activations | Bounded outputs → stabilises higher-order autodiff during residual calc. |
+
+> **Memory note ▸** storing full Jacobians is *not* needed; 2nd-order
+> grads are computed on the fly.
 
 ---
 
-## 6 · `HNN` – minimal Hamiltonian NN (lines 306-356)
-
-* **MLP** outputs `(F₁, F₂)` (a 2-vector).  
-* **Fixed symplectic matrix J** registered as a buffer so `.to(device)` moves it automatically.
-* **`time_derivative`** (327-341)  
-  1. Split MLP output.  
-  2. Compute gradient of `F₂` with respect to input `(θ, ω)`.  
-  3. Multiply by `Jᵀ` → canonical equations:  
-     ```
-     θ̇ =  ∂F₂/∂ω
-     ω̇ = −∂F₂/∂θ
-     ```
-Thus the net learns a **single scalar potential** that implicitly defines the vector field.
+### 5.1  `forward` (lines 276-284)
+```python
+276     def forward(self, qv: torch.Tensor) -> torch.Tensor:
+280         return self.net(qv)
+```
+*Aim ▸* pure function **(…, 2d) → (…, 1)**.  
+No state, no side-effects, deterministic.
 
 ---
 
-### Cheat-sheet of how everything connects
-
-```
-image (B,3,H,W)
-   │
-PatchEmbed ──► (B,N,D) ────► +pos ──► context_encoder
-                                    │         ▲
-                                    │         │ no-grad
-                                    ▼         │
-mask.ctx  random.ctx        predictor MLP     │
-mask.tgt  block.tgt            │              │
-      ▼                        │              │
-target_encoder ────────────────┴──────────────┘
-              MSE loss (JEPA)
+### 5.2  `lagrangian_residual` (lines 286-300)
+```python
+291         z  = torch.cat([q, v], -1).reshape(B*T, -1).requires_grad_(True)
+292         L  = self.forward(z).sum()
+294         dLd = torch.autograd.grad(L, z, create_graph=True)[0]
+295         dLdq, dLdv = dLd.split(d, -1)
+298         d_dt_dLdv = (dLdv[:, 1:] - dLdv[:, :-1]) / dt    # (B,T-1,d)
+299         res       = d_dt_dLdv - dLdq[:, :-1]             # Euler–Lagrange
 ```
 
-* The **visual backbone** (PatchEmbed + Transformer) supplies an embedding space.  
-* **JEPA loss** aligns *visible* and *masked* sub-views.  
-* **LNN/HNN** attach downstream to `(θ, ω)` sequences (not to pixels) to enforce physics consistency.
+| Line | Explanation |
+|------|-------------|
+| **291** | Concatenate `q` and `v`, flatten batch/time to 1-D list so autodiff can treat it as one big variable block. `requires_grad_(True)` enables ∂L/∂(q,v). |
+| **292** | `.sum()` collapses to scalar so `torch.autograd.grad` returns the **full gradient** wrt `z`. |
+| **294-295** | Split gradient into ∂L/∂q and ∂L/∂v, then reshape back to `(B,T,d)`. |
+| **298** | Finite-difference time derivative **Δ(∂L/∂v)/Δt** (backward-Euler). |
+| **299** | Euler–Lagrange residual vector. |
 
-You now have a complete mental map to modify, extend, or debug any part of the architecture without black-box guessing.
+```python
+300         return res.pow(2).mean()          # global MSE  (default path)
+```
+*Line 300*  Squared residual averaged over **batch, time, DoF** → scalar
+loss for optimisation.
+
+> **Numerical subtleties**  
+> • Using `create_graph=True` keeps autograd tape alive, allowing
+>   **∂/∂θ (EL residual)** during *outer* optimisation.  
+> • Finite-difference assumes **fixed dt**; pass correct `dt` from your
+>   dataset loader for accurate physics.
+
+---
+
+### ★ Tuning levers (LNN)
+
+| Goal | Change | Trade-off |
+|------|--------|-----------|
+| Fit stiffer potentials | `hidden_dim↑` or add more layers | 2nd-order grads more expensive. |
+| Smoother learned L | replace `Tanh` w/ `Softplus` | Loss of odd symmetry may slow convergence. |
+| Inspect per-step violation | call with `per_time_step=True` and plot. | Useful for diagnosing where dynamics break. |
+
+---
+
+## 6 · `HNN` — minimal *Hamiltonian* neural network  
+*Learns F : ℝ² → ℝ², reconstructs vector field via symplectic form.*
+
+### 6.0  Constructor (lines 306-321)
+```python
+312         self.net = nn.Sequential(
+313             nn.Linear(2, hidden_dim),
+314             nn.Tanh(),
+315             nn.Linear(hidden_dim, hidden_dim),
+316             nn.Tanh(),
+317             nn.Linear(hidden_dim, 2),    # (F₁, F₂)
+318         )
+319         self.register_buffer("J", torch.tensor([[0.0, 1.0],
+320                                                 [-1.0, 0.0]]))
+```
+*Design notes*
+
+* **Hidden size = 256** matches LNN for apples-to-apples.  
+* `register_buffer` puts **J** inside the module so it obeys
+  `.to(device)` & checkpointing, yet is not a gradient parameter.
+
+---
+
+### 6.1  `time_derivative` (lines 323-341)
+```python
+327         F1, F2 = self.net(qp).split(1, 1)               # (B,1) each
+329         dF2 = torch.autograd.grad(F2.sum(), qp,
+330                                   create_graph=True)[0]
+331         return dF2 @ self.J.T                           # (θ̇, ω̇)
+```
+*Line-by-line*
+
+| Ln | Action | Why |
+|----|--------|-----|
+| **327** | MLP output split: only **F₂** is used (canonical trick). | Guarantee that vector field is *curl-free* by construction. |
+| **329** | Gradient wrt input yields **∂F₂/∂θ, ∂F₂/∂ω**. | Need higher-order grads for Hamiltonian loss. |
+| **331** | Matrix-multiply with Jᵀ implements canonical equations:  
+`[ θ̇ ; ω̇ ] = Jᵀ ∇F₂`. | Ensures energy-conserving dynamics. |
+
+> **Why not output scalar H?**  
+> 2-output formulation avoids having to differentiate *twice*; cheaper.
+
+---
+
+### ★ Tuning levers (HNN)
+
+| Desire | Change | Effect |
+|--------|--------|--------|
+| Multi-DoF system | input dim = `2d`, output dim = `d` (only F₂) | Must build block-diag `J`. |
+| Enforce damping | add learned **dissipation network** & modify J | Breaks strict symplecticity but covers real frictional pendulum. |
+| Stiffer dynamics | deeper MLP or `Softplus` activations | Watch for exploding higher-order grads. |
+
+---
+
+## Expanded architecture **cheat-sheet**
+
+```
+        +---------------- Pendulum RGB frame (B,3,64,64) ----------------+
+        |                                                               |
+PatchEmbed (conv stride = 8)                                            |
+        │  ↓ (B,N=64,D)                                                 |
+ +‒‒‒‒‒‒+‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒‒+
+ | add learned pos-embed                                               |
+ +-------------+--------------------------------------------------------+
+               │
+      MaskingStrategy (per-batch) ──► ctx_mask  (block)  ───┐
+                                          tgt_mask  (rand)  │ disjoint
+               │                                            │
++--------------┴-------------------+     +------------------┴---------------+
+|  context_encoder (6 × ViT layer) |     | target_encoder (6 × ViT layer)   |
++----------------------------------+     +----------------------------------+
+               │                                   │  (no-grad)             │
+               └──────── predictor MLP ────────────┼─────────► tgt_emb (N,D)
+                           │                      loss = MSE
+               ctx_emb ───► pred_emb              (patch-wise)
+```
+
+*Downstream physics heads*
+
+```
+     (θ,ω) sequence  ───►  LNN        → Euler-Lagrange residual
+                    └──►  HNN        → symplectic vector field
+```
+
+**Dataflow summary**
+
+1. **V-JEPA** learns rich latent embeddings from *partially masked* pixel
+   inputs → captures spatial context.
+2. **Decoder-less**: no pixel reconstruction, only feature alignment.
+3. **LNN/HNN** attach to θ-ω state space to enforce **physics priors**
+   during fine-tuning or auxiliary loss training.
