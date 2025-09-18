@@ -348,15 +348,26 @@ def evaluate_mode(
     E_curve, E_rate = energy_drift_curve(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l)
     metrics.update(Δ_rate=Δ_rate, E_rate=E_rate)
 
-    if save_curves:
-        metrics["Δ_curve"] = Δ_curve.tolist()
-        metrics["E_curve"] = E_curve.tolist()
-
     if lnn is not None:
         EL_curve, EL_rate = el_residual_curve(lnn, θ, ω, dt=cfg.dt)
         metrics["EL_rate"] = EL_rate
-        if save_curves:
+
+    if save_curves:
+        # keep JSON (back-compat)
+        metrics["Δ_curve"] = Δ_curve.tolist()
+        metrics["E_curve"] = E_curve.tolist()
+        if lnn is not None:
             metrics["EL_curve"] = EL_curve.tolist()
+    
+        # add compact sidecar
+        curves_path = os.path.join(cfg.out_dir, f"curves_{mode}{cfg.suffix}.npz")
+        np.savez_compressed(
+            curves_path,
+            delta_curve=np.asarray(Δ_curve, dtype=np.float32),
+            energy_curve=np.asarray(E_curve, dtype=np.float32),
+            **({"el_curve": np.asarray(EL_curve, dtype=np.float32)} if lnn is not None else {})
+        )
+        metrics["curves_npz"] = curves_path  # tiny pointer in JSON
 
     # 7) -------- latent-head diagnostics ---------------------------
     θ_t, ω_t, θ_p, ω_p = collect_head_scatter(
