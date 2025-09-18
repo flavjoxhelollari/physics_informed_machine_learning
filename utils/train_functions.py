@@ -171,8 +171,10 @@ def run_mode(cfg: TrainConfig, dataloader: DataLoader) -> None:
     torch.save(ckpt, os.path.join(cfg.model_dir, f"model_{cfg.mode}{cfg.suffix}.pt"))
 
     csv_path = os.path.join(cfg.log_dir, f"train_{cfg.mode}{cfg.suffix}.csv")
-    with open(csv_path,"w",newline="") as f:
-        csv.DictWriter(f, fieldnames=rows[0].keys()).writeheader(); f.writerows(rows)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
 
     np.savez(os.path.join(cfg.log_dir, f"results_{cfg.mode}{cfg.suffix}.npz"),
              loss_total=np.array([r["total"] for r in rows]),
