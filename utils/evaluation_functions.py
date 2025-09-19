@@ -90,8 +90,76 @@ class EvalConfig:
     ndiv_step: int = -1  # used only when ndiv_reduce == "step"
 
 
+# # ====================================================================
+# # 2 · Head scatter collector
+# # ====================================================================
+# def collect_head_scatter(
+#     model: VJEPA,
+#     head:  torch.nn.Module,
+#     dataset,
+#     *,
+#     n_samples: int,
+#     batch:     int
+# ) -> tuple[np.ndarray, ...]:
+#     """
+#     Sample up to *n_samples* frames (t=0) and return:
+
+#     Returns
+#     -------
+#     θ_true, ω_true, θ_pred, ω_pred : np.ndarray
+#         All shape (n_samples,)
+#     """
+#     # put sub-nets in eval mode
+#     model.eval(); head.eval()
+
+#     # random batching
+#     loader = DataLoader(dataset, batch_size=batch, shuffle=True)
+
+#     # pre-allocate Python lists, convert later
+#     θ_true, ω_true, θ_pred, ω_pred = [], [], [], []
+#     collected = 0                                                     # counter
+
+#     for seq, states in loader:                                        # loop batches
+#         imgs = seq[:, 0].to(device)                                   # (B,C,H,W) first frame
+#         with torch.no_grad():                                         # no grad needed
+#             z_lat = model.patch_embed(imgs) + model.pos_embed         # patch + pos
+#             z_lat = model.context_encoder(z_lat).mean(1)              # (B,D) pooled
+#             θ_hat, ω_hat = head(z_lat).split(1, 1)                    # (B,1) each
+
+#         # store CPU numpy copies
+#         θ_true.extend(states[:, 0, 0].cpu().numpy())                  # real θ
+#         ω_true.extend(states[:, 0, 1].cpu().numpy())                  # real ω
+#         θ_pred.extend(θ_hat.squeeze().cpu().numpy())                  # predicted θ
+#         ω_pred.extend(ω_hat.squeeze().cpu().numpy())                  # predicted ω
+
+#         collected += imgs.size(0)                                     # update counter
+#         if collected >= n_samples:                                    # stop if enough
+#             break                                                     # … exit loop
+
+#     # cast lists → numpy of exact length n_samples
+#     return (np.array(θ_true)[:n_samples],
+#             np.array(ω_true)[:n_samples],
+#             np.array(θ_pred)[:n_samples],
+#             np.array(ω_pred)[:n_samples])
+
+
+# # ====================================================================
+# # 3 · Tiny regression helper (latent-head)
+# # ====================================================================
+# def head_regression_metrics(
+#     θ_t: np.ndarray, ω_t: np.ndarray,
+#     θ_p: np.ndarray, ω_p: np.ndarray
+# ) -> Dict[str, float]:
+#     """Return R² and MSE for θ and ω."""
+#     return dict(
+#         r2_theta  = float(r2_score(θ_t, θ_p)),
+#         mse_theta = float(mean_squared_error(θ_t, θ_p)),
+#         r2_omega  = float(r2_score(ω_t, ω_p)),
+#         mse_omega = float(mean_squared_error(ω_t, ω_p)),
+#     )
+
 # ====================================================================
-# 2 · Head scatter collector
+# 2 · Head scatter collector (robust)
 # ====================================================================
 def collect_head_scatter(
     model: VJEPA,
@@ -99,48 +167,70 @@ def collect_head_scatter(
     dataset,
     *,
     n_samples: int,
-    batch:     int
-) -> tuple[np.ndarray, ...]:
+    batch:     int,
+    shuffle:   bool = True,
+    seed:      int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Sample up to *n_samples* frames (t=0) and return:
+    Sample up to *n_samples* first-frame (t=0) examples and return:
+        θ_true, ω_true, θ_pred, ω_pred  (all shape (n_samples,))
 
-    Returns
-    -------
-    θ_true, ω_true, θ_pred, ω_pred : np.ndarray
-        All shape (n_samples,)
+    Notes
+    -----
+    • Uses model/head's own device.
+    • Uses eval mode + no grad.
+    • `shuffle=False` if you want a uniform sweep over IC order.
     """
     # put sub-nets in eval mode
     model.eval(); head.eval()
 
-    # random batching
-    loader = DataLoader(dataset, batch_size=batch, shuffle=True)
+    # device from model params (safer than global `device`)
+    mdev = next(model.parameters()).device
 
-    # pre-allocate Python lists, convert later
+    # cap samples
+    n_total = len(dataset)
+    n_take  = min(n_samples, n_total)
+    if n_take <= 0:
+        return (np.empty(0),)*4
+
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+
+    loader = DataLoader(
+        dataset,
+        batch_size = batch,
+        shuffle    = shuffle,
+        generator  = g if shuffle and seed is not None else None,
+        num_workers= 0,
+        pin_memory = False,
+    )
+
     θ_true, ω_true, θ_pred, ω_pred = [], [], [], []
-    collected = 0                                                     # counter
+    collected = 0
 
-    for seq, states in loader:                                        # loop batches
-        imgs = seq[:, 0].to(device)                                   # (B,C,H,W) first frame
-        with torch.no_grad():                                         # no grad needed
-            z_lat = model.patch_embed(imgs) + model.pos_embed         # patch + pos
-            z_lat = model.context_encoder(z_lat).mean(1)              # (B,D) pooled
-            θ_hat, ω_hat = head(z_lat).split(1, 1)                    # (B,1) each
+    with torch.no_grad():
+        for seq, states in loader:
+            imgs = seq[:, 0].to(mdev, non_blocking=False)  # (B,C,H,W)
 
-        # store CPU numpy copies
-        θ_true.extend(states[:, 0, 0].cpu().numpy())                  # real θ
-        ω_true.extend(states[:, 0, 1].cpu().numpy())                  # real ω
-        θ_pred.extend(θ_hat.squeeze().cpu().numpy())                  # predicted θ
-        ω_pred.extend(ω_hat.squeeze().cpu().numpy())                  # predicted ω
+            z_lat = model.patch_embed(imgs) + model.pos_embed
+            z_lat = model.context_encoder(z_lat).mean(1)   # (B,D)
+            θ_hat, ω_hat = head(z_lat).split(1, dim=1)     # (B,1) each
 
-        collected += imgs.size(0)                                     # update counter
-        if collected >= n_samples:                                    # stop if enough
-            break                                                     # … exit loop
+            # store CPU numpy copies (use squeeze(1) to keep batch dim safe)
+            θ_true.extend(states[:, 0, 0].cpu().numpy())
+            ω_true.extend(states[:, 0, 1].cpu().numpy())
+            θ_pred.extend(θ_hat.squeeze(1).detach().cpu().numpy())
+            ω_pred.extend(ω_hat.squeeze(1).detach().cpu().numpy())
 
-    # cast lists → numpy of exact length n_samples
-    return (np.array(θ_true)[:n_samples],
-            np.array(ω_true)[:n_samples],
-            np.array(θ_pred)[:n_samples],
-            np.array(ω_pred)[:n_samples])
+            collected += imgs.size(0)
+            if collected >= n_take:
+                break
+
+    return (np.asarray(θ_true)[:n_take],
+            np.asarray(ω_true)[:n_take],
+            np.asarray(θ_pred)[:n_take],
+            np.asarray(ω_pred)[:n_take])
 
 
 # ====================================================================
@@ -151,13 +241,20 @@ def head_regression_metrics(
     θ_p: np.ndarray, ω_p: np.ndarray
 ) -> Dict[str, float]:
     """Return R² and MSE for θ and ω."""
-    return dict(
-        r2_theta  = float(r2_score(θ_t, θ_p)),
-        mse_theta = float(mean_squared_error(θ_t, θ_p)),
-        r2_omega  = float(r2_score(ω_t, ω_p)),
-        mse_omega = float(mean_squared_error(ω_t, ω_p)),
-    )
+    # Optional: drop NaNs/Infs to avoid sklearn errors
+    def _clean(a, b):
+        m = np.isfinite(a) & np.isfinite(b)
+        return a[m], b[m]
 
+    θ_t, θ_p = _clean(θ_t, θ_p)
+    ω_t, ω_p = _clean(ω_t, ω_p)
+
+    return dict(
+        r2_theta  = float(r2_score(θ_t, θ_p))  if θ_t.size else 0.0,
+        mse_theta = float(mean_squared_error(θ_t, θ_p)) if θ_t.size else 0.0,
+        r2_omega  = float(r2_score(ω_t, ω_p))  if ω_t.size else 0.0,
+        mse_omega = float(mean_squared_error(ω_t, ω_p)) if ω_t.size else 0.0,
+    )
 
 # ====================================================================
 # 4 · Evaluate ONE mode  ––  **now aware of `combine`**
