@@ -91,6 +91,143 @@ def neighbour_divergence(
                          omega[i, step] - omega[j, step]], dim=1) # Δω
     return diff.norm(dim=1).mean().item()                         # scalar
 
+def _reduce_over_time(dist_pairs_T: torch.Tensor, *,   # shape (P, T)
+                      reduce: str, step: int) -> float:
+    if dist_pairs_T.numel() == 0:
+        return 0.0
+    if reduce == "mean":
+        return dist_pairs_T.mean().item()
+    # "step": pick a single time index (supports negative indices)
+    t_idx = step if step >= 0 else dist_pairs_T.size(1) + step
+    t_idx = max(0, min(t_idx, dist_pairs_T.size(1)-1))
+    return dist_pairs_T[:, t_idx].mean().item()
+
+def neighbour_divergence_scalar_pairwise(
+    θ: torch.Tensor, ω: torch.Tensor, *,
+    eps: float = 0.1, reduce: str = "step", step: int = -1
+) -> float:
+    start = torch.stack([θ[:, 0], ω[:, 0]], dim=1)  # (N,2)
+    dist0 = torch.cdist(start, start, p=2)          # (N,N)
+    mask  = (dist0 > 0) & (dist0 < eps)
+    if not mask.any():
+        return 0.0
+    # gather pairs once
+    I, J = torch.nonzero(mask, as_tuple=True)
+    dθ = θ[I] - θ[J]                                 # (P,T)
+    dω = ω[I] - ω[J]
+    dist_pairs_T = torch.linalg.vector_norm(
+        torch.stack([dθ, dω], dim=0), dim=0)         # (P,T)
+    return _reduce_over_time(dist_pairs_T, reduce=reduce, step=step)
+
+def neighbour_divergence_scalar_grid(
+    θ: torch.Tensor, ω: torch.Tensor, *,
+    theta_axis: np.ndarray, omega_axis: np.ndarray,
+    stencil: str = "8", reduce: str = "step", step: int = -1
+) -> float:
+    N, T = θ.shape
+    Th, Om = len(theta_axis), len(omega_axis)
+    assert N == Th * Om, "Grid size mismatch"
+    offs4 = [(+1,0), (-1,0), (0,+1), (0,-1)]
+    offs8 = offs4 + [(+1,+1), (+1,-1), (-1,+1), (-1,-1)]
+    offs  = offs8 if stencil == "8" else offs4
+    pairs = []
+    for i in range(Th):
+        for j in range(Om):
+            src = i*Om + j
+            for di, dj in offs:
+                ii, jj = i+di, j+dj
+                if 0 <= ii < Th and 0 <= jj < Om:
+                    pairs.append((src, ii*Om + jj))
+    if not pairs:
+        return 0.0
+    I = torch.tensor([p[0] for p in pairs], dtype=torch.long)
+    J = torch.tensor([p[1] for p in pairs], dtype=torch.long)
+    dθ = θ[I] - θ[J]                                  # (P,T)
+    dω = ω[I] - ω[J]
+    dist_pairs_T = torch.linalg.vector_norm(
+        torch.stack([dθ, dω], dim=0), dim=0)          # (P,T)
+    return _reduce_over_time(dist_pairs_T, reduce=reduce, step=step)
+
+def neighbour_divergence_scalar_window(
+    θ: torch.Tensor, ω: torch.Tensor, *,
+    theta0: np.ndarray, omega0: np.ndarray,
+    dθ_max: float, dω_max: float,
+    max_neighbours: int | None = None,
+    reduce: str = "step", step: int = -1
+) -> float:
+    N, _ = θ.shape
+    I_list, J_list = [], []
+    for i in range(N):
+        mask = (np.abs(theta0 - theta0[i]) <= dθ_max) & (np.abs(omega0 - omega0[i]) <= dω_max)
+        idx = np.nonzero(mask)[0]
+        idx = idx[idx != i]
+        if max_neighbours is not None and idx.size > max_neighbours:
+            idx = idx[:max_neighbours]
+        for j in idx:
+            I_list.append(i); J_list.append(int(j))
+    if not I_list:
+        return 0.0
+    I = torch.tensor(I_list, dtype=torch.long)
+    J = torch.tensor(J_list, dtype=torch.long)
+    dθ = θ[I] - θ[J]                                   # (P,T)
+    dω = ω[I] - ω[J]
+    dist_pairs_T = torch.linalg.vector_norm(
+        torch.stack([dθ, dω], dim=0), dim=0)           # (P,T)
+    return _reduce_over_time(dist_pairs_T, reduce=reduce, step=step)
+
+def neighbour_divergence_scalar_knn(
+    θ: torch.Tensor, ω: torch.Tensor, *,
+    k: int = 8, reduce: str = "step", step: int = -1
+) -> float:
+    start = torch.stack([θ[:, 0], ω[:, 0]], dim=1)     # (N,2)
+    d0 = torch.cdist(start, start, p=2)                # (N,N)
+    d0.fill_diagonal_(float("inf"))
+    k_eff = min(k, d0.size(1)-1)
+    idx = torch.topk(d0, k=k_eff, largest=False).indices  # (N,k)
+    # build P = N*k pairs
+    I = torch.arange(idx.size(0)).repeat_interleave(idx.size(1))
+    J = idx.reshape(-1)
+    dθ = θ[I] - θ[J]                                   # (P,T)
+    dω = ω[I] - ω[J]
+    dist_pairs_T = torch.linalg.vector_norm(
+        torch.stack([dθ, dω], dim=0), dim=0)           # (P,T)
+    return _reduce_over_time(dist_pairs_T, reduce=reduce, step=step)
+
+def neighbour_divergence_scalar_dispatch(
+    θ: torch.Tensor, ω: torch.Tensor, cfg: EvalConfig, *,
+    theta_axis: np.ndarray | None = None,
+    omega_axis: np.ndarray | None = None,
+    theta0: np.ndarray | None = None,
+    omega0: np.ndarray | None = None,
+) -> float:
+    if cfg.ndiv_mode == "pairwise":
+        return neighbour_divergence_scalar_pairwise(
+            θ, ω, eps=cfg.ndiv_eps, reduce=cfg.ndiv_reduce, step=cfg.ndiv_step
+        )
+    elif cfg.ndiv_mode == "grid":
+        if theta_axis is None or omega_axis is None:
+            raise ValueError("grid mode needs theta_axis and omega_axis")
+        return neighbour_divergence_scalar_grid(
+            θ, ω, theta_axis=theta_axis, omega_axis=omega_axis,
+            stencil=cfg.ndiv_stencil, reduce=cfg.ndiv_reduce, step=cfg.ndiv_step
+        )
+    elif cfg.ndiv_mode == "window":
+        if theta0 is None or omega0 is None:
+            raise ValueError("window mode needs theta0/omega0 arrays")
+        dθ = cfg.ndiv_dtheta; dω = cfg.ndiv_domega
+        if dθ is None or dω is None:
+            raise ValueError("window mode needs ndiv_dtheta and ndiv_domega")
+        return neighbour_divergence_scalar_window(
+            θ, ω, theta0=theta0, omega0=omega0,
+            dθ_max=dθ, dω_max=dω, max_neighbours=None,
+            reduce=cfg.ndiv_reduce, step=cfg.ndiv_step
+        )
+    elif cfg.ndiv_mode == "knn":
+        return neighbour_divergence_scalar_knn(
+            θ, ω, k=cfg.ndiv_k, reduce=cfg.ndiv_reduce, step=cfg.ndiv_step
+        )
+    else:
+        raise ValueError(f"Unknown ndiv_mode: {cfg.ndiv_mode}")
 
 # =====================================================================
 # 2 · Energy drift
@@ -264,87 +401,6 @@ def neighbour_divergence_curve(
     slope = _linear_slope(curve)                      # growth-rate
     return (curve if return_curve else None), slope
 
-# -------------------------------------------------------------------
-# 7b · Energy-drift curve + rate
-# -------------------------------------------------------------------
-def energy_drift_curve(
-    θ: torch.Tensor, ω: torch.Tensor,
-    *,
-    m: float = 1.0, g: float = 9.81, l: float = 1.0,
-    return_curve: bool = False
-) -> Tuple[np.ndarray | None, float]:
-    """
-    |E(t) – E(0)| averaged over rollout.
-    """
-    θ_np, ω_np = θ.numpy(), ω.numpy()                 # (N,T)
-
-    E = 0.5 * m * l**2 * ω_np**2 + m * g * l * (1 - np.cos(θ_np))
-    drift = np.abs(E - E[:, [0]])                     # (N,T)
-
-    curve = drift.mean(0)                             # (T,)
-    slope = _linear_slope(curve)
-    return (curve if return_curve else None), slope
-
-# -------------------------------------------------------------------
-# 7c · Euler–Lagrange residual curve + rate
-# -------------------------------------------------------------------
-def el_residual_curve(
-    lnn,
-    θ: torch.Tensor, ω: torch.Tensor,
-    *,
-    dt: float,
-    return_curve: bool = False
-) -> Tuple[np.ndarray | None, float]:
-    """
-    Per-time-step Euler–Lagrange residual ‖d/dt ∂L/∂v – ∂L/∂q‖².
-
-    Parameters
-    ----------
-    lnn
-        Trained :class:`~utils.models.LNN` (expects concat [q, v]).
-    θ, ω
-        Trajectories, each shape ``(N, T)`` **on CPU**.
-    dt
-        Time increment between frames (must match roll-out).
-    return_curve
-        • **True**  → return *(curve, slope)*  
-        • **False** → return *(None,  slope)*  (saves memory)
-
-    Returns
-    -------
-    curve : np.ndarray | None   (length **T-1**)
-    slope : float               linear drift-rate  d(residual)/dt
-    """
-    # -------- move inputs to the same device as LNN -----------------
-    dev = next(lnn.parameters()).device
-    q = θ.to(dev)[:, :, None]          # (N,T,1)
-    v = ω.to(dev)[:, :, None]
-
-    # -------- split t   and  t+1  -----------------------------------
-    q0, q1 = q[:, :-1], q[:, 1:]       # (N,T-1,1)
-    v0, v1 = v[:, :-1], v[:, 1:]
-
-    # Need grads on q0, v0, v1 for autograd
-    q0, v0, v1 = q0.requires_grad_(True), v0.requires_grad_(True), v1.requires_grad_(True)
-
-    # -------- ∂L/∂q  and  ∂L/∂v  at t -------------------------------
-    L0   = lnn(torch.cat([q0, v0], dim=-1)).sum()
-    dLdq0, dLdv0 = torch.autograd.grad(L0, (q0, v0), create_graph=True)
-
-    # -------- ∂L/∂v  at t+1  (needed for finite difference) ---------
-    L1   = lnn(torch.cat([q1, v1], dim=-1)).sum()
-    dLdv1 = torch.autograd.grad(L1, v1, create_graph=True)[0]
-
-    # -------- residual  --------------------------------------------
-    dLdv_dt = (dLdv1 - dLdv0) / dt                     # finite difference
-    res     = (dLdv_dt - dLdq0).square().squeeze(-1)   # (N,T-1)
-    curve_t = res.mean(0)                              # (T-1,)
-
-    curve   = curve_t.detach().cpu().numpy()           # ← detach fixes crash
-    slope   = _linear_slope(curve, dt)
-
-    return (curve if return_curve else None), slope
-
 def neighbour_divergence_curve_window(
     θ: torch.Tensor, ω: torch.Tensor,                      # (N,T) CPU
     theta0: np.ndarray, omega0: np.ndarray,                # (N,) true ICs
@@ -436,3 +492,113 @@ def neighbour_divergence_curve_grid(
     curve = dist.mean(dim=0).numpy()   # (T,)
     slope = _linear_slope(curve)
     return (curve if return_curve else None), slope
+
+def neighbour_divergence_curve_k(
+    θ: torch.Tensor, ω: torch.Tensor,
+    *, k: int = 8, return_curve: bool = False
+) -> tuple[np.ndarray|None, float]:
+    """
+    k-NN version: for each trajectory, average distance to its k nearest
+    neighbours (in phase space at t=0), then average across trajectories.
+    """
+    # (N,T) CPU tensors expected
+    start = torch.stack([θ[:, 0], ω[:, 0]], dim=1)   # (N,2)
+    d0 = torch.cdist(start, start, p=2)              # (N,N)
+    d0.fill_diagonal_(float("inf"))
+    idx = torch.topk(d0, k=min(k, θ.size(0)-1), largest=False).indices  # (N,k)
+
+    N, T = θ.shape
+    curve_acc = torch.zeros(T, dtype=torch.float32)
+    for i in range(N):
+        j = idx[i]                                  # (k,)
+        dθ = θ[i].unsqueeze(0) - θ[j]               # (k,T)
+        dω = ω[i].unsqueeze(0) - ω[j]               # (k,T)
+        dij = torch.linalg.vector_norm(
+            torch.stack([dθ, dω], dim=0), dim=0)    # (k,T)
+        curve_acc += dij.mean(dim=0)
+
+    curve = (curve_acc / N).numpy()
+    slope = _linear_slope(curve)
+    return (curve if return_curve else None), slope
+
+# -------------------------------------------------------------------
+# 7b · Energy-drift curve + rate
+# -------------------------------------------------------------------
+def energy_drift_curve(
+    θ: torch.Tensor, ω: torch.Tensor,
+    *,
+    m: float = 1.0, g: float = 9.81, l: float = 1.0,
+    return_curve: bool = False
+) -> Tuple[np.ndarray | None, float]:
+    """
+    |E(t) – E(0)| averaged over rollout.
+    """
+    θ_np, ω_np = θ.numpy(), ω.numpy()                 # (N,T)
+
+    E = 0.5 * m * l**2 * ω_np**2 + m * g * l * (1 - np.cos(θ_np))
+    drift = np.abs(E - E[:, [0]])                     # (N,T)
+
+    curve = drift.mean(0)                             # (T,)
+    slope = _linear_slope(curve)
+    return (curve if return_curve else None), slope
+
+# -------------------------------------------------------------------
+# 7c · Euler–Lagrange residual curve + rate
+# -------------------------------------------------------------------
+def el_residual_curve(
+    lnn,
+    θ: torch.Tensor, ω: torch.Tensor,
+    *,
+    dt: float,
+    return_curve: bool = False
+) -> Tuple[np.ndarray | None, float]:
+    """
+    Per-time-step Euler–Lagrange residual ‖d/dt ∂L/∂v – ∂L/∂q‖².
+
+    Parameters
+    ----------
+    lnn
+        Trained :class:`~utils.models.LNN` (expects concat [q, v]).
+    θ, ω
+        Trajectories, each shape ``(N, T)`` **on CPU**.
+    dt
+        Time increment between frames (must match roll-out).
+    return_curve
+        • **True**  → return *(curve, slope)*  
+        • **False** → return *(None,  slope)*  (saves memory)
+
+    Returns
+    -------
+    curve : np.ndarray | None   (length **T-1**)
+    slope : float               linear drift-rate  d(residual)/dt
+    """
+    # -------- move inputs to the same device as LNN -----------------
+    dev = next(lnn.parameters()).device
+    q = θ.to(dev)[:, :, None]          # (N,T,1)
+    v = ω.to(dev)[:, :, None]
+
+    # -------- split t   and  t+1  -----------------------------------
+    q0, q1 = q[:, :-1], q[:, 1:]       # (N,T-1,1)
+    v0, v1 = v[:, :-1], v[:, 1:]
+
+    # Need grads on q0, v0, v1 for autograd
+    q0, v0, v1 = q0.requires_grad_(True), v0.requires_grad_(True), v1.requires_grad_(True)
+
+    # -------- ∂L/∂q  and  ∂L/∂v  at t -------------------------------
+    L0   = lnn(torch.cat([q0, v0], dim=-1)).sum()
+    dLdq0, dLdv0 = torch.autograd.grad(L0, (q0, v0), create_graph=True)
+
+    # -------- ∂L/∂v  at t+1  (needed for finite difference) ---------
+    L1   = lnn(torch.cat([q1, v1], dim=-1)).sum()
+    dLdv1 = torch.autograd.grad(L1, v1, create_graph=True)[0]
+
+    # -------- residual  --------------------------------------------
+    dLdv_dt = (dLdv1 - dLdv0) / dt                     # finite difference
+    res     = (dLdv_dt - dLdq0).square().squeeze(-1)   # (N,T-1)
+    curve_t = res.mean(0)                              # (T-1,)
+
+    curve   = curve_t.detach().cpu().numpy()           # ← detach fixes crash
+    slope   = _linear_slope(curve, dt)
+
+    return (curve if return_curve else None), slope
+

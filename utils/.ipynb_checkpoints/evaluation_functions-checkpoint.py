@@ -75,6 +75,20 @@ class EvalConfig:
     #batch-size
     batch_size       : int   = 64
 
+    # --- NEW: neighbour divergence options ---
+    # mode: "pairwise" (original O(N^2)), "grid" (adjacent ICs), "window" (Δθ/Δω thresholds), "knn"
+    ndiv_mode: str = "grid"          # good default for gridded eval
+    ndiv_stencil: str = "8"          # used when ndiv_mode="grid" ("4" or "8")
+    ndiv_k: int = 8                  # used when ndiv_mode="knn"
+    ndiv_dtheta: float | None = None # used when ndiv_mode="window"
+    ndiv_domega: float | None = None # used when ndiv_mode="window"
+    ndiv_eps: float = 0.1
+
+    # NEW: how to reduce across time for the scalar Δ_div
+    # "step" → use ndiv_step index; "mean" → average over all T
+    ndiv_reduce: Literal["step","mean"] = "step"
+    ndiv_step: int = -1  # used only when ndiv_reduce == "step"
+
 
 # ====================================================================
 # 2 · Head scatter collector
@@ -148,135 +162,6 @@ def head_regression_metrics(
 # ====================================================================
 # 4 · Evaluate ONE mode  ––  **now aware of `combine`**
 # ====================================================================
-# def evaluate_mode(
-#     mode       : str,
-#     dataset,
-#     cfg        : EvalConfig,
-#     *,
-#     combine            : str | tuple[str, float] | None = None,  # ← NEW
-#     plot_head_scatter  : bool = False
-# ) -> Dict[str, float]:
-#     """
-#     Run inference for a single checkpoint (plain, hnn, lnn, hnn+lnn).
-
-#     Parameters
-#     ----------
-#     mode
-#         Which checkpoint to load (plain / hnn / lnn / hnn+lnn).
-#     dataset
-#         Evaluation dataset (must yield tensors on CPU).
-#     cfg
-#         Shared :class:`EvalConfig` with horizon, dt, dirs…
-#     combine
-#         *Only* relevant when the checkpoint **contains both** physics nets
-#         (i.e. *hnn+lnn* run):
-
-#         ================  ============================================
-#         ``None``          → use *HNN only* (silently ignore LNN)  
-#         ``"mean"``        → α = ½(α_HNN + α_LNN)  
-#         ``"sum"``         → α = α_HNN + α_LNN  
-#         ``("blend", w)``  → α = w·α_HNN + (1‒w)·α_LNN (0 ≤ w ≤ 1)  
-#         ================  ============================================
-
-#     plot_head_scatter
-#         If *True*, show θ/ω scatter­plots.
-
-#     Returns
-#     -------
-#     Dict[str, float]
-#         Physics metrics + latent-head regression diagnostics.
-#     """
-#     # 1) -------- load raw state-dicts (flat or prefixed) ------------
-#     v_sd, t_sd, hnn_sd, lnn_sd = load_components(
-#         mode, suffix=cfg.suffix, base_dir=cfg.model_dir)
-
-#     # 2) -------- recreate modules & load weights --------------------
-#     model = VJEPA(embed_dim=384, depth=6, num_heads=6).to(device)
-#     head  = torch.nn.Linear(384, 2).to(device)
-#     model.load_state_dict(v_sd, strict=True)
-#     head .load_state_dict(t_sd, strict=True)
-
-#     hnn = lnn = None
-#     if hnn_sd:
-#         hnn = HNN(hidden_dim=256).to(device)
-#         hnn.load_state_dict(hnn_sd, strict=True)
-#     if lnn_sd:
-#         lnn = LNN(input_dim=2, hidden_dim=256).to(device)
-#         lnn.load_state_dict(lnn_sd, strict=True)
-
-#     # 3) -------- deterministic evaluation loader -------------------
-#     eval_loader = DataLoader(dataset, batch_size=64, shuffle=False)
-
-#     # 4) -------- latent roll-out (passes `combine`) -----------------
-#     θ, ω, _ = rollout(model, head,
-#                       hnn           = hnn,
-#                       lnn           = lnn,
-#                       combine       = combine,
-#                       horizon       = cfg.horizon,
-#                       dt            = cfg.dt,
-#                       eval_loader   = eval_loader)
-
-#     # 5) -------- physics metrics ------------------------------------
-#     metrics = {
-#         "Δ_div"  : neighbour_divergence(θ, ω),
-#         "E_drift": energy_drift(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l),
-#     }
-#     if lnn is not None:                                   # ← now unconditional
-#         metrics["EL_res"] = el_residual_metric(lnn, θ, ω, dt=cfg.dt)
-    
-#     # 5b) -------- dynamic “speed” metrics ------------------------------
-#     # curves + slopes
-#     div_curve,  div_rate  = neighbour_divergence_curve(θ, ω)
-#     ed_curve,   ed_rate   = energy_drift_curve(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l)
-#     if lnn is not None:                                   # only if an LNN exists
-#         el_curve,   el_rate = el_residual_curve(lnn, θ, ω, dt=cfg.dt)
-#         metrics.update(EL_rate = el_rate)
-#         # you can also stash the full curve if you like:
-#         # metrics["EL_curve"] = el_curve.tolist()
-
-#     # always record divergence / energy rates
-#     metrics.update(
-#         Δ_rate   = div_rate,
-#         E_rate   = ed_rate,
-#     )
-
-#     # 6) -------- latent-head diagnostics ----------------------------
-#     θ_t, ω_t, θ_p, ω_p = collect_head_scatter(
-#         model, head, dataset,
-#         n_samples = cfg.scatter_samples,
-#         batch     = cfg.scatter_batch)
-
-#     metrics.update(head_regression_metrics(θ_t, ω_t, θ_p, ω_p))
-
-#     if plot_head_scatter:
-#         plt.figure(figsize=(10, 5))               # keep wide canvas if you like
-#         # --- θ scatter ---------------------------------------------------
-#         plt.subplot(1, 2, 1)
-#         plt.scatter(θ_t, θ_p, s=8, alpha=.6)
-#         plt.xlabel("true θ");  plt.ylabel("pred θ")
-#         plt.grid(True)
-#         plt.xlim(-4, 4);      plt.ylim(-4, 4)   # ← NEW: fixed 10×10 window
-#         plt.gca().set_aspect("equal", adjustable="box")  # keep square axes
-#         # --- ω scatter ---------------------------------------------------
-#         plt.subplot(1, 2, 2)
-#         plt.scatter(ω_t, ω_p, s=8, alpha=.6)
-#         plt.xlabel("true ω");  plt.ylabel("pred ω")
-#         plt.grid(True)
-#         plt.xlim(-10, 10);      plt.ylim(-10, 10)   # ← identical limits
-#         plt.gca().set_aspect("equal", adjustable="box")
-#         # ---------------------------------------------------------------
-#         plt.suptitle(f"Head predictions vs truth – {mode}")
-#         plt.tight_layout();  plt.show()
-
-#     # 7) -------- save per-mode JSON ---------------------------------
-#     os.makedirs(cfg.out_dir, exist_ok=True)
-#     out_path = os.path.join(cfg.out_dir, f"metrics_{mode}{cfg.suffix}.json")
-#     with open(out_path, "w") as f:
-#         json.dump(metrics, f, indent=2)
-
-#     print(f"{mode:8} →", metrics, f"(saved → {out_path})")
-#     return metrics
-
 def evaluate_mode(
     mode       : str,
     dataset,
