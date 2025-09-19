@@ -22,7 +22,7 @@ from __future__ import annotations  # ← forward-ref typing (Py < 3.11)
 
 import os, json                                   # file I/O helpers
 from dataclasses import dataclass, asdict         # lightweight settings
-from typing      import Dict, Iterable, List      # static typing
+from typing      import Dict, Iterable, List, Literal      # static typing
 
 import numpy as np                                # numeric arrays
 import torch                                      # tensors & autograd
@@ -37,12 +37,7 @@ from sklearn.linear_model import LinearRegression          # linear-fit
 # --------------------------------------------------------------------
 from utils.models              import VJEPA, HNN, LNN                # NN classes
 from utils.loading_functions   import load_components                # ckpt splitter
-from utils.evaluation_metrics  import ( neighbour_divergence,
-                                   energy_drift,
-                                   el_residual_metric,
-                                   neighbour_divergence_curve,
-                                   energy_drift_curve,
-                                   el_residual_curve)        # metric fns
+from utils.evaluation_metrics  import *
 from utils.helper_functions    import rollout                        # latent rollout
 
 # CUDA if available, otherwise CPU
@@ -52,42 +47,122 @@ device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cp
 # ====================================================================
 # 1 · Dataclass holding every evaluation hyper-parameter
 # ====================================================================
+# evaluation_config.py
+
 @dataclass
 class EvalConfig:
-    """All knobs for a single evaluation run (defaults = your current)."""
-    suffix           : str   = "_dense"      # checkpoint suffix
-    model_dir        : str   = "./models"    # where model_*.pt live
-    out_dir          : str   = "./metrics"   # where metrics_*.json are written
+    """
+    All evaluation knobs for a single run.
 
-    # roll-out parameters (used by `rollout`)
-    horizon          : int   = 60            # time-steps (3 s if dt=0.05)
-    dt               : float = 0.05          # simulation Δt
+    Paths / I/O
+    -----------
+    suffix     : checkpoint suffix used when loading (e.g., "_dense")
+    model_dir  : directory containing model_*.pt
+    out_dir    : directory to write metrics_*.json (+ optional curves .npz)
 
-    # physical constants for energy / accel ground-truth
-    m                : float = 1.0
-    g                : float = 9.81
-    l                : float = 1.0
+    Rollout
+    -------
+    horizon    : number of rollout time steps
+    dt         : integration time step
+    rollout_init : how to initialise (θ,ω) from the sequence frames.
+                   "first" → frame-0 only (current rollout default)
+                   "mean3" → average encodings from first 3 frames
+                   (requires the tiny patch in `rollout` you added)
 
-    # latent-head scatter settings
-    scatter_samples  : int   = 500
-    scatter_batch    : int   = 64
+    Physics constants
+    -----------------
+    m, g, l    : mass, gravity, length (for energy & analytic α)
 
-    #batch-size
-    batch_size       : int   = 64
+    Batching
+    --------
+    batch_size : eval DataLoader batch size
 
-    # --- NEW: neighbour divergence options ---
-    # mode: "pairwise" (original O(N^2)), "grid" (adjacent ICs), "window" (Δθ/Δω thresholds), "knn"
-    ndiv_mode: str = "grid"          # good default for gridded eval
-    ndiv_stencil: str = "8"          # used when ndiv_mode="grid" ("4" or "8")
-    ndiv_k: int = 8                  # used when ndiv_mode="knn"
-    ndiv_dtheta: float | None = None # used when ndiv_mode="window"
-    ndiv_domega: float | None = None # used when ndiv_mode="window"
-    ndiv_eps: float = 0.1
+    Latent-head diagnostics (scatter)
+    ---------------------------------
+    scatter_samples : number of examples to probe (t=0)
+    scatter_batch   : batch size for the probe loader
+    scatter_shuffle : shuffle the probe loader
+    scatter_seed    : optional RNG seed (applied only if shuffle=True)
 
-    # NEW: how to reduce across time for the scalar Δ_div
-    # "step" → use ndiv_step index; "mean" → average over all T
-    ndiv_reduce: Literal["step","mean"] = "step"
-    ndiv_step: int = -1  # used only when ndiv_reduce == "step"
+    Neighbour-divergence (Δ_div) – dispatcher & reduction
+    -----------------------------------------------------
+    ndiv_mode    : {"pairwise","grid","window","knn"}
+      • "pairwise": O(N^2) within ε
+      • "grid"   : only neighbouring ICs on a rectangular grid (stencil = "4" or "8")
+      • "window" : fixed small deltas in (θ,ω) space (|Δθ|≤dθ, |Δω|≤dω)
+      • "knn"    : k nearest neighbours in initial phase-space
+    ndiv_stencil : {"4","8"}    (used when ndiv_mode="grid")
+    ndiv_k       : int          (used when ndiv_mode="knn")
+    ndiv_dtheta  : float | None (used when ndiv_mode="window")
+    ndiv_domega  : float | None (used when ndiv_mode="window")
+    ndiv_eps     : float        (radius used by "pairwise" — legacy)
+    ndiv_reduce  : {"step","mean"}   how to reduce the Δ(t) curve → scalar
+    ndiv_step    : int               step index if reduce="step" (supports negatives)
+
+    ▼ Replicate your *old* Δ_div (pairwise at final step):
+        ndiv_mode="pairwise", ndiv_eps=0.1, ndiv_reduce="step", ndiv_step=-1
+
+    Euler–Lagrange residual (EL) – throttles & reduction
+    ----------------------------------------------------
+    el_t_max   : None|int   → use only first `t_max` steps (after stride)
+    el_stride  : int        → temporal downsampling factor
+    el_max_ic  : None|int   → limit number of trajectories (ICs)
+    el_reduce  : {"mean","step"}   curve → scalar
+    el_step    : int               index if reduce="step" (supports negatives)
+
+    ▼ Replicate your *old* EL metric (mean over first 3 frames):
+        el_t_max=3, el_stride=1, el_max_ic=None, el_reduce="mean"
+
+    Curves persistence
+    ------------------
+    save_curves : if True, evaluate_mode will write a compressed .npz
+                  with Δ_curve / E_curve / (EL_curve if available),
+                  and place a pointer path into the JSON.
+    """
+
+    # ---------- Paths ----------
+    suffix:    str = "_dense"
+    model_dir: str = "./models"
+    out_dir:   str = "./metrics"
+
+    # ---------- Rollout ----------
+    horizon: int = 60
+    dt:      float = 0.05
+    rollout_init: Literal["first","mean3"] = "first"  # needs rollout patch for "mean3"
+
+    # ---------- Physics ----------
+    m: float = 1.0
+    g: float = 9.81
+    l: float = 1.0
+
+    # ---------- Batching ----------
+    batch_size: int = 64
+
+    # ---------- Scatter diagnostics ----------
+    scatter_samples: int = 500
+    scatter_batch:   int = 64
+    scatter_shuffle: bool = True
+    scatter_seed:    int | None = None
+
+    # ---------- Neighbour-divergence ----------
+    ndiv_mode:    Literal["pairwise","grid","window","knn"] = "grid"
+    ndiv_stencil: Literal["4","8"] = "8"     # only used for mode="grid"
+    ndiv_k:       int = 8                    # only used for mode="knn"
+    ndiv_dtheta:  float | None = None        # only used for mode="window"
+    ndiv_domega:  float | None = None        # only used for mode="window"
+    ndiv_eps:     float = 0.1                # only used for mode="pairwise"
+    ndiv_reduce:  Literal["step","mean"] = "step"
+    ndiv_step:    int = -1
+
+    # ---------- Euler–Lagrange residual ----------
+    el_t_max:  int | None = None
+    el_stride: int = 1
+    el_max_ic: int | None = None
+    el_reduce: Literal["mean","step"] = "mean"
+    el_step:   int = -1
+
+    # ---------- Curves persistence ----------
+    save_curves: bool = False
 
 
 # # ====================================================================
@@ -259,6 +334,42 @@ def head_regression_metrics(
 # ====================================================================
 # 4 · Evaluate ONE mode  ––  **now aware of `combine`**
 # ====================================================================
+# ===========================================
+# IC/grid helpers (place near top of file)
+# ===========================================
+def _initial_conditions(theta: torch.Tensor, omega: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    θ0 = theta[:, 0].detach().cpu().numpy()
+    ω0 = omega[:, 0].detach().cpu().numpy()
+    return θ0, ω0
+
+def _infer_grid_axes(theta0: np.ndarray, omega0: np.ndarray, tol: float = 1e-6) -> tuple[np.ndarray | None, np.ndarray | None]:
+    θu = np.unique(np.round(theta0 / tol) * tol)
+    ωu = np.unique(np.round(omega0 / tol) * tol)
+    if θu.size * ωu.size == theta0.size:
+        return θu, ωu
+    return None, None
+
+def _reorder_to_grid(theta: torch.Tensor, omega: torch.Tensor,
+                     theta0: np.ndarray, omega0: np.ndarray,
+                     theta_axis: np.ndarray, omega_axis: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+    Th, Om = theta_axis.size, omega_axis.size
+    θ2i = {val: i for i, val in enumerate(theta_axis)}
+    ω2j = {val: j for j, val in enumerate(omega_axis)}
+    def q(x): return np.round(x / 1e-6) * 1e-6
+    order_idx = []
+    for th, om in zip(q(theta0), q(omega0)):
+        i = θ2i.get(th, None); j = ω2j.get(om, None)
+        if i is None or j is None:
+            order = np.lexsort((omega0, theta0))  # θ outer, ω inner
+            return theta[order], omega[order]
+        order_idx.append(i * Om + j)
+    inv_perm = np.argsort(order_idx).astype(np.int64)
+    inv_perm_t = torch.from_numpy(inv_perm).to(theta.device)
+    return theta.index_select(0, inv_perm_t), omega.index_select(0, inv_perm_t)
+
+# ====================================================================
+# Evaluate ONE mode — wired to dispatchers + helper rollout
+# ====================================================================
 def evaluate_mode(
     mode       : str,
     dataset,
@@ -266,35 +377,13 @@ def evaluate_mode(
     *,
     combine           : str | tuple[str, float] | None = None,
     plot_head_scatter : bool = False,
-    save_curves       : bool = False,          # ← NEW FLAG
+    save_curves       : bool | None = None,  # None → cfg.save_curves
 ) -> Dict[str, float]:
-    """
-    Inference + physics metrics for one checkpoint.
-
-    Parameters
-    ----------
-    …
-    save_curves
-        If **True**, also dump the full per-step curves
-        ``Δ_curve``, ``E_curve`` and (when LNN present) ``EL_curve`` to
-        the output JSON.  Beware: curves are length ≈ `cfg.horizon` and
-        stored as full-precision floats, so the file grows linearly with
-        horizon.
-
-    Returns
-    -------
-    Dict[str, float]
-        Keys:
-            Δ_div, E_drift, EL_res (if LNN),
-            Δ_rate, E_rate, EL_rate (if LNN),
-            (optionally the three *_curve lists)
-            + latent-head regression stats.
-    """
-    # 1) -------- load state-dicts -----------------------------------
+    # 1) load components
     v_sd, t_sd, hnn_sd, lnn_sd = load_components(
         mode, suffix=cfg.suffix, base_dir=cfg.model_dir)
 
-    # 2) -------- rebuild modules & weights --------------------------
+    # 2) rebuild modules
     model = VJEPA(embed_dim=384, depth=6, num_heads=6).to(device)
     head  = torch.nn.Linear(384, 2).to(device)
     model.load_state_dict(v_sd, strict=True)
@@ -306,71 +395,106 @@ def evaluate_mode(
     if lnn_sd:
         lnn = LNN(input_dim=2, hidden_dim=256).to(device); lnn.load_state_dict(lnn_sd, strict=True)
 
-    # 3) -------- fixed evaluation DataLoader ------------------------
+    # 3) eval loader
     eval_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
 
-    # 4) -------- latent rollout -------------------------------------
-    θ, ω, _ = rollout(
+    # 4) rollout (helper_functions.py signature)
+    θ, ω, α = rollout(
         model, head,
-        hnn         = hnn,
-        lnn         = lnn,
-        combine     = combine,
-        horizon     = cfg.horizon,
-        dt          = cfg.dt,
-        eval_loader = eval_loader
+        eval_loader=eval_loader,
+        horizon=cfg.horizon,
+        dt=cfg.dt,
+        hnn=hnn,
+        lnn=lnn,
+        combine=combine
     )
+    θc, ωc = θ.detach().cpu(), ω.detach().cpu()  # metrics run on CPU
 
-    # 5) -------- base physics metrics -------------------------------
+    # 5) ICs / grid axes for dispatchers
+    θ0_np, ω0_np = _initial_conditions(θc, ωc)
+    θ_axis = ω_axis = None
+    if cfg.ndiv_mode in ("grid", "window"):
+        θ_axis, ω_axis = _infer_grid_axes(θ0_np, ω0_np)
+    if cfg.ndiv_mode == "grid" and θ_axis is not None and ω_axis is not None:
+        θc, ωc = _reorder_to_grid(θc, ωc, θ0_np, ω0_np, θ_axis, ω_axis)
+        θ0_np, ω0_np = _initial_conditions(θc, ωc)  # keep ICs in sync
+
+    # 6) scalar metrics
+    Δ_div = neighbour_divergence_scalar_dispatch(
+        θc, ωc, cfg,
+        theta_axis=θ_axis, omega_axis=ω_axis,
+        theta0=θ0_np,    omega0=ω0_np
+    )
     metrics: Dict[str, float] = {
-        "Δ_div"  : neighbour_divergence(θ, ω),
-        "E_drift": energy_drift(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l),
+        "Δ_div"  : float(Δ_div),
+        "E_drift": float(energy_drift(θc, ωc, m=cfg.m, g=cfg.g, l=cfg.l)),
     }
+    if α is not None:
+        metrics["accel_mse"] = float(accel_mse(θc, α.detach().cpu(), g=cfg.g, l=cfg.l))
     if lnn is not None:
-        metrics["EL_res"] = el_residual_metric(lnn, θ, ω, dt=cfg.dt)
+        metrics["EL_res"] = float(el_residual_metric(
+            lnn, θc, ωc, dt=cfg.dt,
+            t_max=cfg.el_t_max, stride=cfg.el_stride, max_ic=cfg.el_max_ic,
+            reduce=cfg.el_reduce, step=cfg.el_step
+        ))
 
-    # 6) -------- per-step curves + rates ----------------------------
-    Δ_curve, Δ_rate = neighbour_divergence_curve(θ, ω)
-    E_curve, E_rate = energy_drift_curve(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l)
-    metrics.update(Δ_rate=Δ_rate, E_rate=E_rate)
+    # 7) curves + rates
+    Δ_curve, Δ_rate = neighbour_divergence_curve_dispatch(
+        θc, ωc, cfg,
+        theta_axis=θ_axis, omega_axis=ω_axis,
+        theta0=θ0_np, omega0=ω0_np,
+        return_curve=True
+    )
+    E_curve, E_rate = energy_drift_curve(θc, ωc, m=cfg.m, g=cfg.g, l=cfg.l)
 
+    metrics.update(Δ_rate=float(Δ_rate), E_rate=float(E_rate))
+
+    EL_curve = None
     if lnn is not None:
-        EL_curve, EL_rate = el_residual_curve(lnn, θ, ω, dt=cfg.dt)
-        metrics["EL_rate"] = EL_rate
+        EL_curve, EL_rate = el_residual_curve(
+            lnn, θc, ωc, dt=cfg.dt,
+            return_curve=True,
+            t_max=cfg.el_t_max, stride=cfg.el_stride, max_ic=cfg.el_max_ic
+        )
+        metrics["EL_rate"] = float(EL_rate)
 
+    # 8) curve persistence
+    if save_curves is None:
+        save_curves = cfg.save_curves
     if save_curves:
-        # keep JSON (back-compat)
-        metrics["Δ_curve"] = Δ_curve.tolist()
-        metrics["E_curve"] = E_curve.tolist()
-        if lnn is not None:
-            metrics["EL_curve"] = EL_curve.tolist()
-    
-        # add compact sidecar
+        metrics["Δ_curve_head"] = Δ_curve[:10].tolist() if Δ_curve is not None else []
+        metrics["E_curve_head"] = E_curve[:10].tolist() if E_curve is not None else []
+        if EL_curve is not None:
+            metrics["EL_curve_head"] = EL_curve[:10].tolist()
+
+        os.makedirs(cfg.out_dir, exist_ok=True)
         curves_path = os.path.join(cfg.out_dir, f"curves_{mode}{cfg.suffix}.npz")
         np.savez_compressed(
             curves_path,
-            delta_curve=np.asarray(Δ_curve, dtype=np.float32),
-            energy_curve=np.asarray(E_curve, dtype=np.float32),
-            **({"el_curve": np.asarray(EL_curve, dtype=np.float32)} if lnn is not None else {})
+            delta_curve=np.asarray(Δ_curve, dtype=np.float32) if Δ_curve is not None else np.zeros(0, np.float32),
+            energy_curve=np.asarray(E_curve, dtype=np.float32) if E_curve is not None else np.zeros(0, np.float32),
+            **({"el_curve": np.asarray(EL_curve, dtype=np.float32)} if EL_curve is not None else {})
         )
-        metrics["curves_npz"] = curves_path  # tiny pointer in JSON
+        metrics["curves_npz"] = curves_path
 
-    # 7) -------- latent-head diagnostics ---------------------------
+    # 9) latent-head diagnostics
     θ_t, ω_t, θ_p, ω_p = collect_head_scatter(
         model, head, dataset,
         n_samples=cfg.scatter_samples,
-        batch    =cfg.scatter_batch)
+        batch    =cfg.scatter_batch,
+        shuffle  =cfg.scatter_shuffle,
+        seed     =cfg.scatter_seed
+    )
     metrics.update(head_regression_metrics(θ_t, ω_t, θ_p, ω_p))
 
-    # 8) -------- optional scatter plot -----------------------------
+    # 10) optional scatter
     if plot_head_scatter:
         plt.figure(figsize=(10, 5))
-        # θ
         plt.subplot(1, 2, 1)
         plt.scatter(θ_t, θ_p, s=8, alpha=.6)
         plt.xlabel("true θ"); plt.ylabel("pred θ")
         plt.grid(True); plt.xlim(-4, 4); plt.ylim(-4, 4)
         plt.gca().set_aspect("equal", adjustable="box")
-        # ω
         plt.subplot(1, 2, 2)
         plt.scatter(ω_t, ω_p, s=8, alpha=.6)
         plt.xlabel("true ω"); plt.ylabel("pred ω")
@@ -379,17 +503,296 @@ def evaluate_mode(
         plt.suptitle(f"Head predictions vs truth – {mode}")
         plt.tight_layout(); plt.show()
 
-    # 9) -------- write JSON ----------------------------------------
+    # 11) write JSON
     os.makedirs(cfg.out_dir, exist_ok=True)
     out_path = os.path.join(cfg.out_dir, f"metrics_{mode}{cfg.suffix}.json")
     with open(out_path, "w") as fp:
         json.dump(metrics, fp, indent=2)
 
-    print(f"{mode:8} →", {k: round(v, 4) if isinstance(v, float) else '…' for k, v in metrics.items()},
+    print(f"{mode:8} →",
+          {k: (round(v, 4) if isinstance(v, float) else '…') for k, v in metrics.items()},
           f"(saved → {out_path})")
     return metrics
+# def evaluate_mode(
+#     mode       : str,
+#     dataset,
+#     cfg        : EvalConfig,
+#     *,
+#     combine           : str | tuple[str, float] | None = None,
+#     plot_head_scatter : bool = False,
+#     save_curves       : bool = False,          # ← NEW FLAG
+# ) -> Dict[str, float]:
+#     """
+#     Inference + physics metrics for one checkpoint.
+
+#     Parameters
+#     ----------
+#     …
+#     save_curves
+#         If **True**, also dump the full per-step curves
+#         ``Δ_curve``, ``E_curve`` and (when LNN present) ``EL_curve`` to
+#         the output JSON.  Beware: curves are length ≈ `cfg.horizon` and
+#         stored as full-precision floats, so the file grows linearly with
+#         horizon.
+
+#     Returns
+#     -------
+#     Dict[str, float]
+#         Keys:
+#             Δ_div, E_drift, EL_res (if LNN),
+#             Δ_rate, E_rate, EL_rate (if LNN),
+#             (optionally the three *_curve lists)
+#             + latent-head regression stats.
+#     """
+#     # 1) -------- load state-dicts -----------------------------------
+#     v_sd, t_sd, hnn_sd, lnn_sd = load_components(
+#         mode, suffix=cfg.suffix, base_dir=cfg.model_dir)
+
+#     # 2) -------- rebuild modules & weights --------------------------
+#     model = VJEPA(embed_dim=384, depth=6, num_heads=6).to(device)
+#     head  = torch.nn.Linear(384, 2).to(device)
+#     model.load_state_dict(v_sd, strict=True)
+#     head .load_state_dict(t_sd, strict=True)
+
+#     hnn = lnn = None
+#     if hnn_sd:
+#         hnn = HNN(hidden_dim=256).to(device); hnn.load_state_dict(hnn_sd, strict=True)
+#     if lnn_sd:
+#         lnn = LNN(input_dim=2, hidden_dim=256).to(device); lnn.load_state_dict(lnn_sd, strict=True)
+
+#     # 3) -------- fixed evaluation DataLoader ------------------------
+#     eval_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
+
+#     # 4) -------- latent rollout -------------------------------------
+#     θ, ω, _ = rollout(
+#         model, head,
+#         hnn         = hnn,
+#         lnn         = lnn,
+#         combine     = combine,
+#         horizon     = cfg.horizon,
+#         dt          = cfg.dt,
+#         eval_loader = eval_loader
+#     )
+
+#     # 5) -------- base physics metrics -------------------------------
+#     metrics: Dict[str, float] = {
+#         "Δ_div"  : neighbour_divergence(θ, ω),
+#         "E_drift": energy_drift(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l),
+#     }
+#     if lnn is not None:
+#         metrics["EL_res"] = el_residual_metric(lnn, θ, ω, dt=cfg.dt)
+
+#     # 6) -------- per-step curves + rates ----------------------------
+#     Δ_curve, Δ_rate = neighbour_divergence_curve(θ, ω)
+#     E_curve, E_rate = energy_drift_curve(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l)
+#     metrics.update(Δ_rate=Δ_rate, E_rate=E_rate)
+
+#     if lnn is not None:
+#         EL_curve, EL_rate = el_residual_curve(lnn, θ, ω, dt=cfg.dt)
+#         metrics["EL_rate"] = EL_rate
+
+#     if save_curves:
+#         # keep JSON (back-compat)
+#         metrics["Δ_curve"] = Δ_curve.tolist()
+#         metrics["E_curve"] = E_curve.tolist()
+#         if lnn is not None:
+#             metrics["EL_curve"] = EL_curve.tolist()
+    
+#         # add compact sidecar
+#         curves_path = os.path.join(cfg.out_dir, f"curves_{mode}{cfg.suffix}.npz")
+#         np.savez_compressed(
+#             curves_path,
+#             delta_curve=np.asarray(Δ_curve, dtype=np.float32),
+#             energy_curve=np.asarray(E_curve, dtype=np.float32),
+#             **({"el_curve": np.asarray(EL_curve, dtype=np.float32)} if lnn is not None else {})
+#         )
+#         metrics["curves_npz"] = curves_path  # tiny pointer in JSON
+
+#     # 7) -------- latent-head diagnostics ---------------------------
+#     θ_t, ω_t, θ_p, ω_p = collect_head_scatter(
+#         model, head, dataset,
+#         n_samples=cfg.scatter_samples,
+#         batch    =cfg.scatter_batch)
+#     metrics.update(head_regression_metrics(θ_t, ω_t, θ_p, ω_p))
+
+#     # 8) -------- optional scatter plot -----------------------------
+#     if plot_head_scatter:
+#         plt.figure(figsize=(10, 5))
+#         # θ
+#         plt.subplot(1, 2, 1)
+#         plt.scatter(θ_t, θ_p, s=8, alpha=.6)
+#         plt.xlabel("true θ"); plt.ylabel("pred θ")
+#         plt.grid(True); plt.xlim(-4, 4); plt.ylim(-4, 4)
+#         plt.gca().set_aspect("equal", adjustable="box")
+#         # ω
+#         plt.subplot(1, 2, 2)
+#         plt.scatter(ω_t, ω_p, s=8, alpha=.6)
+#         plt.xlabel("true ω"); plt.ylabel("pred ω")
+#         plt.grid(True); plt.xlim(-10, 10); plt.ylim(-10, 10)
+#         plt.gca().set_aspect("equal", adjustable="box")
+#         plt.suptitle(f"Head predictions vs truth – {mode}")
+#         plt.tight_layout(); plt.show()
+
+#     # 9) -------- write JSON ----------------------------------------
+#     os.makedirs(cfg.out_dir, exist_ok=True)
+#     out_path = os.path.join(cfg.out_dir, f"metrics_{mode}{cfg.suffix}.json")
+#     with open(out_path, "w") as fp:
+#         json.dump(metrics, fp, indent=2)
+
+#     print(f"{mode:8} →", {k: round(v, 4) if isinstance(v, float) else '…' for k, v in metrics.items()},
+#           f"(saved → {out_path})")
+#     return metrics
 # ====================================================================
 # 5 · Evaluate *many* modes (auto-detects whether fusion is possible)
+# ====================================================================
+# def evaluate_all_modes(
+#     modes        : Iterable[str],
+#     dataset,
+#     cfg          : EvalConfig,
+#     *,
+#     combine      : str | tuple[str, float] | None = "mean",
+#     plot_scatter : bool = False,
+# ) -> Dict[str, Dict[str, float]]:
+#     """
+#     Run :func:`evaluate_mode` for every string in *modes*.
+
+#     The helper **checks each checkpoint first** and forwards the *combine*
+#     argument **only when *both* physics nets are present** (otherwise the
+#     call falls back to ``combine=None`` so that the run is *not* skipped).
+
+#     Parameters
+#     ----------
+#     modes
+#         Iterable with any subset of ``{"plain","hnn","lnn","hnn+lnn"}``.
+#     dataset
+#         Evaluation dataset (e.g. deterministic Pendulum grid).
+#     cfg
+#         Shared :class:`EvalConfig` (horizon, dt, paths…).
+#     combine
+#         Fusion rule when *both* HNN **and** LNN exist in the checkpoint
+#         (ignored otherwise).  Supported values:
+
+#         ================  ============================================
+#         ``None``          do **not** fuse – use HNN alone  
+#         ``"mean"``        α = ½ (α_HNN + α_LNN)  ← **default**  
+#         ``"sum"``         α = α_HNN + α_LNN  
+#         ``("blend", w)``  α = w·α_HNN + (1-w)·α_LNN  (0 ≤ w ≤ 1)  
+#         ================  ============================================
+
+#     plot_scatter
+#         Forwarded to :func:`evaluate_mode(plot_head_scatter=…)`.
+
+#     Returns
+#     -------
+#     dict
+#         ``{mode: metric-dict}`` for every *successfully* evaluated mode.
+#         The same object is also written as JSON to
+#         ``cfg.out_dir / metrics_all<suffix>.json``.
+#     """
+#     all_metrics: Dict[str, Dict[str, float]] = {}
+
+#     for mode in modes:
+#         try:
+#             # --- lightweight peek: are both physics nets stored? ----
+#             _, _, hnn_sd, lnn_sd = load_components(
+#                 mode,
+#                 suffix       = cfg.suffix,
+#                 base_dir     = cfg.model_dir,
+#                 map_location = "cpu")               # tiny, no GPU alloc
+
+#             # decide on the fusion rule to pass downstream
+#             comb_arg = combine if (hnn_sd and lnn_sd) else None
+
+#             # ------------------ full evaluation --------------------
+#             all_metrics[mode] = evaluate_mode(
+#                 mode,
+#                 dataset,
+#                 cfg,
+#                 combine           = comb_arg,
+#                 plot_head_scatter = plot_scatter
+#             )
+#         except FileNotFoundError as err:
+#             print(f"[{mode}] skipped – checkpoint not found: {err}")
+#         except ValueError as err:
+#             # propagate unexpected errors but keep loop alive
+#             print(f"[{mode}] skipped – {err}")
+
+#     # ------------------ persist combined dict -----------------------
+#     os.makedirs(cfg.out_dir, exist_ok=True)
+#     out_file = os.path.join(cfg.out_dir, f"metrics_all{cfg.suffix}.json")
+#     with open(out_file, "w") as fh:
+#         json.dump(all_metrics, fh, indent=2)
+
+#     print(f"\n✓ combined metrics saved → {out_file}")
+#     return all_metrics
+
+# # ====================================================================
+# # 6 · Legacy plotting helpers
+# # ====================================================================
+# _REMAP = {"total":"loss_total","jepa":"loss_jepa",
+#           "hnn":"loss_hnn","lnn":"loss_lnn","sup":"loss_sup"}
+
+# metrics_to_plot: list[tuple[str, str]] = [
+#     ("loss_total", "total objective"),
+#     ("loss_hnn",   "HNN residual"),
+#     ("loss_lnn",   "LNN residual"),
+#     ("loss_jepa",  "JEPA reconstruction"),
+#     ("loss_sup",   "θ supervision"),
+# ]
+
+# def normalise_keys(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+#     """Map legacy keys (total/jepa/…) → new loss_* names."""
+#     return { _REMAP.get(k, k): v for k,v in arrays.items() }
+
+# def plot_loss(
+#     component: str,
+#     logs: Dict[str, Dict[str, np.ndarray]],
+#     *,
+#     ylabel: str | None = None
+# ) -> None:
+#     """
+#     Overlay loss curves from multiple runs.
+
+#     Parameters
+#     ----------
+#     component : e.g. 'loss_total', 'loss_hnn', …
+#     logs      : mode → arrays (already `normalise_keys`-processed)
+#     """
+#     plt.figure(figsize=(7,4))
+#     for mode, rec in logs.items():
+#         if component in rec:
+#             plt.plot(rec[component], label=mode)
+#     plt.xlabel("epoch")
+#     plt.ylabel(ylabel or component)
+#     plt.title(component)
+#     plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+    
+# def plot_selected_losses(
+#     logs: Dict[str, Dict[str, np.ndarray]],
+#     *,
+#     items: list[tuple[str, str]] = metrics_to_plot
+# ) -> None:
+#     """
+#     Iterate over `items` and draw a loss curve **only if** at least one
+#     run in `logs` contains the given key.
+
+#     Parameters
+#     ----------
+#     logs
+#         Dict mapping *mode* → dict of numpy arrays
+#         (already passed through `normalise_keys` if needed).
+#     items
+#         Sequence of ``(loss_key, y-label)`` tuples.  Defaults to the
+#         canonical list above.
+#     """
+#     for key, label in items:
+#         if any(key in rec for rec in logs.values()):  # at least one run has it?
+#             plot_loss(key, logs, ylabel=label)        # use the existing helper
+#         else:
+#             print(f"[skip] no log contains '{key}'")
+
+# ====================================================================
+# Evaluate MANY modes — auto-detect fusion, pass cfg/switches
 # ====================================================================
 def evaluate_all_modes(
     modes        : Iterable[str],
@@ -398,141 +801,29 @@ def evaluate_all_modes(
     *,
     combine      : str | tuple[str, float] | None = "mean",
     plot_scatter : bool = False,
+    save_curves  : bool | None = None,   # None → cfg.save_curves
 ) -> Dict[str, Dict[str, float]]:
-    """
-    Run :func:`evaluate_mode` for every string in *modes*.
-
-    The helper **checks each checkpoint first** and forwards the *combine*
-    argument **only when *both* physics nets are present** (otherwise the
-    call falls back to ``combine=None`` so that the run is *not* skipped).
-
-    Parameters
-    ----------
-    modes
-        Iterable with any subset of ``{"plain","hnn","lnn","hnn+lnn"}``.
-    dataset
-        Evaluation dataset (e.g. deterministic Pendulum grid).
-    cfg
-        Shared :class:`EvalConfig` (horizon, dt, paths…).
-    combine
-        Fusion rule when *both* HNN **and** LNN exist in the checkpoint
-        (ignored otherwise).  Supported values:
-
-        ================  ============================================
-        ``None``          do **not** fuse – use HNN alone  
-        ``"mean"``        α = ½ (α_HNN + α_LNN)  ← **default**  
-        ``"sum"``         α = α_HNN + α_LNN  
-        ``("blend", w)``  α = w·α_HNN + (1-w)·α_LNN  (0 ≤ w ≤ 1)  
-        ================  ============================================
-
-    plot_scatter
-        Forwarded to :func:`evaluate_mode(plot_head_scatter=…)`.
-
-    Returns
-    -------
-    dict
-        ``{mode: metric-dict}`` for every *successfully* evaluated mode.
-        The same object is also written as JSON to
-        ``cfg.out_dir / metrics_all<suffix>.json``.
-    """
     all_metrics: Dict[str, Dict[str, float]] = {}
-
     for mode in modes:
         try:
-            # --- lightweight peek: are both physics nets stored? ----
             _, _, hnn_sd, lnn_sd = load_components(
-                mode,
-                suffix       = cfg.suffix,
-                base_dir     = cfg.model_dir,
-                map_location = "cpu")               # tiny, no GPU alloc
-
-            # decide on the fusion rule to pass downstream
+                mode, suffix=cfg.suffix, base_dir=cfg.model_dir, map_location="cpu"
+            )
             comb_arg = combine if (hnn_sd and lnn_sd) else None
-
-            # ------------------ full evaluation --------------------
             all_metrics[mode] = evaluate_mode(
-                mode,
-                dataset,
-                cfg,
-                combine           = comb_arg,
-                plot_head_scatter = plot_scatter
+                mode, dataset, cfg,
+                combine=comb_arg,
+                plot_head_scatter=plot_scatter,
+                save_curves=save_curves
             )
         except FileNotFoundError as err:
             print(f"[{mode}] skipped – checkpoint not found: {err}")
         except ValueError as err:
-            # propagate unexpected errors but keep loop alive
             print(f"[{mode}] skipped – {err}")
 
-    # ------------------ persist combined dict -----------------------
     os.makedirs(cfg.out_dir, exist_ok=True)
     out_file = os.path.join(cfg.out_dir, f"metrics_all{cfg.suffix}.json")
     with open(out_file, "w") as fh:
         json.dump(all_metrics, fh, indent=2)
-
     print(f"\n✓ combined metrics saved → {out_file}")
     return all_metrics
-
-# ====================================================================
-# 6 · Legacy plotting helpers
-# ====================================================================
-_REMAP = {"total":"loss_total","jepa":"loss_jepa",
-          "hnn":"loss_hnn","lnn":"loss_lnn","sup":"loss_sup"}
-
-metrics_to_plot: list[tuple[str, str]] = [
-    ("loss_total", "total objective"),
-    ("loss_hnn",   "HNN residual"),
-    ("loss_lnn",   "LNN residual"),
-    ("loss_jepa",  "JEPA reconstruction"),
-    ("loss_sup",   "θ supervision"),
-]
-
-def normalise_keys(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    """Map legacy keys (total/jepa/…) → new loss_* names."""
-    return { _REMAP.get(k, k): v for k,v in arrays.items() }
-
-def plot_loss(
-    component: str,
-    logs: Dict[str, Dict[str, np.ndarray]],
-    *,
-    ylabel: str | None = None
-) -> None:
-    """
-    Overlay loss curves from multiple runs.
-
-    Parameters
-    ----------
-    component : e.g. 'loss_total', 'loss_hnn', …
-    logs      : mode → arrays (already `normalise_keys`-processed)
-    """
-    plt.figure(figsize=(7,4))
-    for mode, rec in logs.items():
-        if component in rec:
-            plt.plot(rec[component], label=mode)
-    plt.xlabel("epoch")
-    plt.ylabel(ylabel or component)
-    plt.title(component)
-    plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
-    
-def plot_selected_losses(
-    logs: Dict[str, Dict[str, np.ndarray]],
-    *,
-    items: list[tuple[str, str]] = metrics_to_plot
-) -> None:
-    """
-    Iterate over `items` and draw a loss curve **only if** at least one
-    run in `logs` contains the given key.
-
-    Parameters
-    ----------
-    logs
-        Dict mapping *mode* → dict of numpy arrays
-        (already passed through `normalise_keys` if needed).
-    items
-        Sequence of ``(loss_key, y-label)`` tuples.  Defaults to the
-        canonical list above.
-    """
-    for key, label in items:
-        if any(key in rec for rec in logs.values()):  # at least one run has it?
-            plot_loss(key, logs, ylabel=label)        # use the existing helper
-        else:
-            print(f"[skip] no log contains '{key}'")

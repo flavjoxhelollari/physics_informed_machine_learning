@@ -308,6 +308,7 @@ def accel_mse(
 # =====================================================================
 # 4 · Euler–Lagrange residual (scalar, built from the curve)
 # =====================================================================
+
 def el_residual_metric(
     lnn,
     theta: torch.Tensor,             # (N,T)  CPU or CUDA
@@ -326,7 +327,7 @@ def el_residual_metric(
     Scalar EL residual obtained by computing the per-step EL residual curve
     (see `el_residual_curve`) and then reducing it in time.
 
-    ▼ Replicating *your original behavior* (mean over the first three frames):
+    ▼ Replicate *original behavior* (3 frames):
         el_residual_metric(..., dt=..., t_max=3, stride=1,
                            max_ic=None, reduce="mean")
 
@@ -344,6 +345,13 @@ def el_residual_metric(
     float
         Scalar residual summary after reduction.
     """
+    # basic guards
+    if stride < 1:
+        stride = 1
+    if t_max is not None and t_max < 2:
+        # fewer than 2 time steps can't form a residual
+        return 0.0
+
     curve, _ = el_residual_curve(
         lnn, theta, omega, dt=dt,
         return_curve=True,
@@ -761,7 +769,7 @@ def el_residual_curve(
     computed over time (length T-1 after slicing). Also returns a linear
     slope (drift-rate) fitted to the curve.
 
-    ▼ Replicating *your original* “first three frames” setting:
+    ▼ Replicate *original* “first three frames”:
         el_residual_curve(..., dt=..., return_curve=True,
                           t_max=3, stride=1, max_ic=None)
 
@@ -770,9 +778,13 @@ def el_residual_curve(
     • Inputs are automatically moved to the LNN's device.
     • `t_max`, `stride`, and `max_ic` make evaluation stable for large N,T.
     """
+    # guards
+    if stride < 1:
+        stride = 1
+
     # ---- subset trajectories if requested --------------------------
     if max_ic is not None and θ.size(0) > max_ic:
-        sel = torch.arange(max_ic, dtype=torch.long)
+        sel = torch.arange(max_ic, device=θ.device, dtype=torch.long)  # ← device-safe
         θ = θ.index_select(0, sel)
         ω = ω.index_select(0, sel)
 
@@ -816,13 +828,13 @@ def el_residual_curve(
     res     = (dLdv_dt - dLdq0).square().squeeze(-1)   # (N,T-1)
     curve_t = res.mean(0)                              # (T-1,)
 
-    curve   = curve_t.detach().cpu().numpy()
+    curve   = curve_t.detach().cpu().numpy().astype(np.float32)
+
     # simple linear slope (least-squares fit) for drift-rate
-    t = np.arange(curve.shape[0], dtype=np.float32) * dt
     if curve.size == 0:
         slope = 0.0
     else:
-        # avoid sklearn dependency here
+        t = np.arange(curve.shape[0], dtype=np.float32) * dt
         denom = (t - t.mean()).dot(t - t.mean()) + 1e-12
         slope = float(((curve - curve.mean()).dot(t - t.mean())) / denom)
 
