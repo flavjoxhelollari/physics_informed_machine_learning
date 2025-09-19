@@ -277,33 +277,88 @@ def accel_mse(
     return F.mse_loss(alpha_pred[:, :-1], alpha_true).item()
 
 
+# # =====================================================================
+# # 4 · Euler–Lagrange residual
+# # =====================================================================
+# def el_residual_metric(
+#     lnn,
+#     theta: torch.Tensor,             # (N,T)
+#     omega: torch.Tensor,             # (N,T)
+#     *,
+#     dt: float
+# ) -> float:
+#     """
+#     Mean squared Euler–Lagrange residual R<sub>EL</sub> over the first
+#     three frames *(T ≥ 3 required)*.
+
+#     Implementation details
+#     ----------------------
+#     •  `lnn.lagrangian_residual` expects (B,T,d) on **the same device**
+#        as the LNN’s parameters — tensors are moved automatically.  
+#     •  Only *θ* and *ω* are fed; momentum terms are not needed for a
+#        single-pendulum.
+#     """
+#     q = theta[:, :3, None]                          # (N,3,1)   θ
+#     v = omega[:, :3, None]                          # (N,3,1)   ω
+#     lnn_device = next(lnn.parameters()).device      # LNN’s own device
+#     return lnn.lagrangian_residual(q.to(lnn_device),
+#                                    v.to(lnn_device),
+#                                    dt).item()
+
 # =====================================================================
-# 4 · Euler–Lagrange residual
+# 4 · Euler–Lagrange residual (scalar, built from the curve)
 # =====================================================================
 def el_residual_metric(
     lnn,
-    theta: torch.Tensor,             # (N,T)
+    theta: torch.Tensor,             # (N,T)  CPU or CUDA
     omega: torch.Tensor,             # (N,T)
     *,
-    dt: float
+    dt: float,
+    # Scalability knobs (apply identically to curve & scalar)
+    t_max: int | None = None,        # e.g., 64 → use first t_max steps (after stride)
+    stride: int = 1,                 # e.g., 2  → time downsampling
+    max_ic: int | None = None,       # e.g., 50 → evaluate on subset of trajectories
+    # How to reduce curve → scalar
+    reduce: Literal["mean","step"] = "mean",
+    step: int = -1                   # used only when reduce="step" (supports negatives)
 ) -> float:
     """
-    Mean squared Euler–Lagrange residual R<sub>EL</sub> over the first
-    three frames *(T ≥ 3 required)*.
+    Scalar EL residual obtained by computing the per-step EL residual curve
+    (see `el_residual_curve`) and then reducing it in time.
 
-    Implementation details
-    ----------------------
-    •  `lnn.lagrangian_residual` expects (B,T,d) on **the same device**
-       as the LNN’s parameters — tensors are moved automatically.  
-    •  Only *θ* and *ω* are fed; momentum terms are not needed for a
-       single-pendulum.
+    ▼ Replicating *your original behavior* (mean over the first three frames):
+        el_residual_metric(..., dt=..., t_max=3, stride=1,
+                           max_ic=None, reduce="mean")
+
+    Parameters
+    ----------
+    lnn : trained LNN module (expects concat [q, v] as input)
+    theta, omega : (N,T) rollouts
+    dt : float    step size used in the rollout
+    t_max, stride, max_ic : optional throttles for long horizons / many ICs
+    reduce : "mean" → average over time; "step" → pick a single time index
+    step : index when reduce="step" (e.g., -1 for final step)
+
+    Returns
+    -------
+    float
+        Scalar residual summary after reduction.
     """
-    q = theta[:, :3, None]                          # (N,3,1)   θ
-    v = omega[:, :3, None]                          # (N,3,1)   ω
-    lnn_device = next(lnn.parameters()).device      # LNN’s own device
-    return lnn.lagrangian_residual(q.to(lnn_device),
-                                   v.to(lnn_device),
-                                   dt).item()
+    curve, _ = el_residual_curve(
+        lnn, theta, omega, dt=dt,
+        return_curve=True,
+        t_max=t_max, stride=stride, max_ic=max_ic
+    )
+    if curve is None or len(curve) == 0:
+        return 0.0
+
+    if reduce == "mean":
+        return float(np.mean(curve))
+
+    # reduce == "step"
+    t_idx = step if step >= 0 else len(curve) + step
+    t_idx = max(0, min(t_idx, len(curve) - 1))
+    return float(curve[t_idx])
 
 
 # =====================================================================
@@ -521,6 +576,91 @@ def neighbour_divergence_curve_k(
     slope = _linear_slope(curve)
     return (curve if return_curve else None), slope
 
+from typing import Tuple
+
+def neighbour_divergence_curve_dispatch(
+    θ: torch.Tensor, ω: torch.Tensor, cfg, *,
+    # supply these if your mode needs them:
+    theta_axis: np.ndarray | None = None,
+    omega_axis: np.ndarray | None = None,
+    # for "window" mode:
+    theta0: np.ndarray | None = None,
+    omega0: np.ndarray | None = None,
+    return_curve: bool = True
+) -> Tuple[np.ndarray | None, float]:
+    """
+    Dispatch the neighbour-divergence *curve* based on cfg.ndiv_mode.
+
+    Modes
+    -----
+    - "pairwise": original O(N^2) neighbours (within radius `cfg.ndiv_eps`)
+    - "grid"    : grid-adjacent neighbours (4- or 8-connected via `cfg.ndiv_stencil`)
+    - "window"  : neighbours whose ICs satisfy |Δθ0|<=dθ and |Δω0|<=dω
+                  (`cfg.ndiv_dtheta`, `cfg.ndiv_domega`; defaults to one grid step)
+    - "knn"     : k nearest neighbours at t=0 (`cfg.ndiv_k`)
+
+    Returns
+    -------
+    curve | None, rate
+        curve shape (T,) if `return_curve=True` else None
+        rate = linear slope d⟨Δ⟩/dt (via _linear_slope)
+    """
+    mode = getattr(cfg, "ndiv_mode", "grid")
+
+    if mode == "pairwise":
+        # uses epsilon at t=0
+        eps = getattr(cfg, "ndiv_eps", 0.1)
+        return neighbour_divergence_curve(
+            θ, ω, ε=eps, return_curve=return_curve
+        )
+
+    elif mode == "grid":
+        if theta_axis is None or omega_axis is None:
+            raise ValueError("grid mode requires theta_axis and omega_axis")
+        stencil = getattr(cfg, "ndiv_stencil", "8")
+        return neighbour_divergence_curve_grid(
+            θ, ω,
+            theta_axis=theta_axis, omega_axis=omega_axis,
+            stencil=stencil, return_curve=return_curve
+        )
+
+    elif mode == "window":
+        if theta0 is None or omega0 is None:
+            raise ValueError("window mode requires theta0 and omega0 arrays")
+        # default thresholds to one grid step if not provided
+        dθ = getattr(cfg, "ndiv_dtheta", None)
+        dω = getattr(cfg, "ndiv_domega", None)
+        if dθ is None:
+            if theta_axis is None:
+                raise ValueError("window mode: ndiv_dtheta not set and theta_axis is None")
+            dθ = float(abs(theta_axis[1] - theta_axis[0]))
+            cfg.ndiv_dtheta = dθ
+        if dω is None:
+            if omega_axis is None:
+                raise ValueError("window mode: ndiv_domega not set and omega_axis is None")
+            dω = float(abs(omega_axis[1] - omega_axis[0]))
+            cfg.ndiv_domega = dω
+
+        # optional cap per-i (keeps it linear in N). Leave None to use all in-window
+        max_nb = getattr(cfg, "ndiv_window_max_neighbours", None)
+
+        return neighbour_divergence_curve_window(
+            θ, ω,
+            theta0=theta0, omega0=omega0,
+            dθ_max=dθ, dω_max=dω,
+            max_neighbours=max_nb,
+            return_curve=return_curve
+        )
+
+    elif mode == "knn":
+        k = getattr(cfg, "ndiv_k", 8)
+        return neighbour_divergence_curve_k(
+            θ, ω, k=k, return_curve=return_curve
+        )
+
+    else:
+        raise ValueError(f"Unknown ndiv_mode: {mode}")
+        
 # -------------------------------------------------------------------
 # 7b · Energy-drift curve + rate
 # -------------------------------------------------------------------
@@ -542,36 +682,113 @@ def energy_drift_curve(
     slope = _linear_slope(curve)
     return (curve if return_curve else None), slope
 
+# # -------------------------------------------------------------------
+# # 7c · Euler–Lagrange residual curve + rate
+# # -------------------------------------------------------------------
+# def el_residual_curve(
+#     lnn,
+#     θ: torch.Tensor, ω: torch.Tensor,
+#     *,
+#     dt: float,
+#     return_curve: bool = False
+# ) -> Tuple[np.ndarray | None, float]:
+#     """
+#     Per-time-step Euler–Lagrange residual ‖d/dt ∂L/∂v – ∂L/∂q‖².
+
+#     Parameters
+#     ----------
+#     lnn
+#         Trained :class:`~utils.models.LNN` (expects concat [q, v]).
+#     θ, ω
+#         Trajectories, each shape ``(N, T)`` **on CPU**.
+#     dt
+#         Time increment between frames (must match roll-out).
+#     return_curve
+#         • **True**  → return *(curve, slope)*  
+#         • **False** → return *(None,  slope)*  (saves memory)
+
+#     Returns
+#     -------
+#     curve : np.ndarray | None   (length **T-1**)
+#     slope : float               linear drift-rate  d(residual)/dt
+#     """
+#     # -------- move inputs to the same device as LNN -----------------
+#     dev = next(lnn.parameters()).device
+#     q = θ.to(dev)[:, :, None]          # (N,T,1)
+#     v = ω.to(dev)[:, :, None]
+
+#     # -------- split t   and  t+1  -----------------------------------
+#     q0, q1 = q[:, :-1], q[:, 1:]       # (N,T-1,1)
+#     v0, v1 = v[:, :-1], v[:, 1:]
+
+#     # Need grads on q0, v0, v1 for autograd
+#     q0, v0, v1 = q0.requires_grad_(True), v0.requires_grad_(True), v1.requires_grad_(True)
+
+#     # -------- ∂L/∂q  and  ∂L/∂v  at t -------------------------------
+#     L0   = lnn(torch.cat([q0, v0], dim=-1)).sum()
+#     dLdq0, dLdv0 = torch.autograd.grad(L0, (q0, v0), create_graph=True)
+
+#     # -------- ∂L/∂v  at t+1  (needed for finite difference) ---------
+#     L1   = lnn(torch.cat([q1, v1], dim=-1)).sum()
+#     dLdv1 = torch.autograd.grad(L1, v1, create_graph=True)[0]
+
+#     # -------- residual  --------------------------------------------
+#     dLdv_dt = (dLdv1 - dLdv0) / dt                     # finite difference
+#     res     = (dLdv_dt - dLdq0).square().squeeze(-1)   # (N,T-1)
+#     curve_t = res.mean(0)                              # (T-1,)
+
+#     curve   = curve_t.detach().cpu().numpy()           # ← detach fixes crash
+#     slope   = _linear_slope(curve, dt)
+
+#     return (curve if return_curve else None), slope
+
 # -------------------------------------------------------------------
-# 7c · Euler–Lagrange residual curve + rate
+# 7c · Euler–Lagrange residual curve + rate  (scalable)
 # -------------------------------------------------------------------
 def el_residual_curve(
     lnn,
-    θ: torch.Tensor, ω: torch.Tensor,
+    θ: torch.Tensor, ω: torch.Tensor,    # (N,T)  CPU tensors OK
     *,
     dt: float,
-    return_curve: bool = False
+    return_curve: bool = False,
+    # Scalability knobs
+    t_max: int | None = None,            # use only first t_max steps (after stride)
+    stride: int = 1,                     # temporal downsample
+    max_ic: int | None = None            # evaluate on a subset of trajectories
 ) -> Tuple[np.ndarray | None, float]:
     """
-    Per-time-step Euler–Lagrange residual ‖d/dt ∂L/∂v – ∂L/∂q‖².
+    Per-time-step Euler–Lagrange residual: ‖ d/dt (∂L/∂v) − ∂L/∂q ‖²
+    computed over time (length T-1 after slicing). Also returns a linear
+    slope (drift-rate) fitted to the curve.
 
-    Parameters
-    ----------
-    lnn
-        Trained :class:`~utils.models.LNN` (expects concat [q, v]).
-    θ, ω
-        Trajectories, each shape ``(N, T)`` **on CPU**.
-    dt
-        Time increment between frames (must match roll-out).
-    return_curve
-        • **True**  → return *(curve, slope)*  
-        • **False** → return *(None,  slope)*  (saves memory)
+    ▼ Replicating *your original* “first three frames” setting:
+        el_residual_curve(..., dt=..., return_curve=True,
+                          t_max=3, stride=1, max_ic=None)
 
-    Returns
-    -------
-    curve : np.ndarray | None   (length **T-1**)
-    slope : float               linear drift-rate  d(residual)/dt
+    Notes
+    -----
+    • Inputs are automatically moved to the LNN's device.
+    • `t_max`, `stride`, and `max_ic` make evaluation stable for large N,T.
     """
+    # ---- subset trajectories if requested --------------------------
+    if max_ic is not None and θ.size(0) > max_ic:
+        sel = torch.arange(max_ic, dtype=torch.long)
+        θ = θ.index_select(0, sel)
+        ω = ω.index_select(0, sel)
+
+    # ---- slice time (and then downsample) --------------------------
+    if t_max is not None:
+        θ = θ[:, :t_max]
+        ω = ω[:, :t_max]
+    if stride > 1:
+        θ = θ[:, ::stride]
+        ω = ω[:, ::stride]
+
+    # Need at least 2 steps to form T-1 residuals
+    if θ.size(1) < 2:
+        curve = np.zeros(0, dtype=np.float32)
+        return (curve if return_curve else None), 0.0
+
     # -------- move inputs to the same device as LNN -----------------
     dev = next(lnn.parameters()).device
     q = θ.to(dev)[:, :, None]          # (N,T,1)
@@ -582,7 +799,9 @@ def el_residual_curve(
     v0, v1 = v[:, :-1], v[:, 1:]
 
     # Need grads on q0, v0, v1 for autograd
-    q0, v0, v1 = q0.requires_grad_(True), v0.requires_grad_(True), v1.requires_grad_(True)
+    q0 = q0.requires_grad_(True)
+    v0 = v0.requires_grad_(True)
+    v1 = v1.requires_grad_(True)
 
     # -------- ∂L/∂q  and  ∂L/∂v  at t -------------------------------
     L0   = lnn(torch.cat([q0, v0], dim=-1)).sum()
@@ -597,8 +816,14 @@ def el_residual_curve(
     res     = (dLdv_dt - dLdq0).square().squeeze(-1)   # (N,T-1)
     curve_t = res.mean(0)                              # (T-1,)
 
-    curve   = curve_t.detach().cpu().numpy()           # ← detach fixes crash
-    slope   = _linear_slope(curve, dt)
+    curve   = curve_t.detach().cpu().numpy()
+    # simple linear slope (least-squares fit) for drift-rate
+    t = np.arange(curve.shape[0], dtype=np.float32) * dt
+    if curve.size == 0:
+        slope = 0.0
+    else:
+        # avoid sklearn dependency here
+        denom = (t - t.mean()).dot(t - t.mean()) + 1e-12
+        slope = float(((curve - curve.mean()).dot(t - t.mean())) / denom)
 
     return (curve if return_curve else None), slope
-
