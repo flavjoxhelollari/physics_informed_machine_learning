@@ -344,3 +344,95 @@ def el_residual_curve(
     slope   = _linear_slope(curve, dt)
 
     return (curve if return_curve else None), slope
+
+def neighbour_divergence_curve_window(
+    θ: torch.Tensor, ω: torch.Tensor,                      # (N,T) CPU
+    theta0: np.ndarray, omega0: np.ndarray,                # (N,) true ICs
+    *, dθ_max: float, dω_max: float,
+    max_neighbours: int | None = None,                     # cap per i, optional
+    return_curve: bool = False
+):
+    N, T = θ.shape
+    # sort by theta0 to reduce search (optional micro-opt)
+    order = np.lexsort((omega0, theta0))
+    θ0_sorted, ω0_sorted = theta0[order], omega0[order]
+    θ_sorted, ω_sorted   = θ[order], ω[order]
+
+    pairs_i, pairs_j = [], []
+    for idx_i in range(N):
+        th_i, om_i = θ0_sorted[idx_i], ω0_sorted[idx_i]
+
+        # find candidates within dθ_max along theta axis
+        # (since we sorted primarily by theta, we can scan a small band)
+        # naive safe approach (still fine for N≈100–1000):
+        dθ = np.abs(θ0_sorted - th_i) <= dθ_max
+        dω = np.abs(ω0_sorted - om_i) <= dω_max
+        cand = np.nonzero(dθ & dω)[0]
+        cand = cand[cand != idx_i]
+        if max_neighbours is not None and cand.size > max_neighbours:
+            cand = cand[:max_neighbours]
+        for j in cand:
+            pairs_i.append(idx_i); pairs_j.append(j)
+
+    if len(pairs_i) == 0:
+        curve = np.zeros(T, dtype=np.float32)
+        return (curve if return_curve else None), 0.0
+
+    idx_i_t = torch.tensor(pairs_i, dtype=torch.long)
+    idx_j_t = torch.tensor(pairs_j, dtype=torch.long)
+
+    dθ = θ_sorted[idx_i_t] - θ_sorted[idx_j_t]       # (P,T)
+    dω = ω_sorted[idx_i_t] - ω_sorted[idx_j_t]
+    dist = torch.linalg.vector_norm(torch.stack([dθ, dω], dim=0), dim=0)  # (P,T)
+
+    curve = dist.mean(dim=0).numpy()
+    slope = _linear_slope(curve)
+    return (curve if return_curve else None), slope
+
+import numpy as np, torch
+
+def neighbour_divergence_curve_grid(
+    θ: torch.Tensor, ω: torch.Tensor,                  # (N,T) CPU tensors
+    *, theta_axis: np.ndarray, omega_axis: np.ndarray, # 1D arrays used to build the grid
+    stencil: str = "4",                                # "4" or "8"
+    return_curve: bool = False
+):
+    """
+    Neighbour divergence only to grid-adjacent ICs.
+    Assumes dataset order is theta-outer, omega-inner (no shuffle) so that
+    index = iθ * Om + jω.
+    """
+    N, T = θ.shape
+    Th, Om = len(theta_axis), len(omega_axis)
+    assert N == Th * Om, "θ/ω count does not match theta×omega grid size"
+
+    # build (iθ, jω) for each trajectory
+    ij = np.array([(i, j) for i in range(Th) for j in range(Om)], dtype=int)
+
+    # neighbour offsets
+    offs4 = [(+1,0), (-1,0), (0,+1), (0,-1)]
+    offs8 = offs4 + [(+1,+1), (+1,-1), (-1,+1), (-1,-1)]
+    offs  = offs8 if stencil == "8" else offs4
+
+    # collect all valid neighbour pairs (i -> j) once
+    pairs = []
+    for idx, (i, j) in enumerate(ij):
+        for di, dj in offs:
+            ii, jj = i+di, j+dj
+            if 0 <= ii < Th and 0 <= jj < Om:
+                nbr = ii*Om + jj
+                pairs.append((idx, nbr))
+    if len(pairs) == 0:
+        curve = np.zeros(T, dtype=np.float32)
+        return (curve if return_curve else None), 0.0
+
+    # stack distances over time
+    idx_i = torch.tensor([p[0] for p in pairs], dtype=torch.long)
+    idx_j = torch.tensor([p[1] for p in pairs], dtype=torch.long)
+    dθ = θ[idx_i] - θ[idx_j]           # (P, T)
+    dω = ω[idx_i] - ω[idx_j]           # (P, T)
+    dist = torch.linalg.vector_norm(torch.stack([dθ, dω], dim=0), dim=0)   # (P, T)
+
+    curve = dist.mean(dim=0).numpy()   # (T,)
+    slope = _linear_slope(curve)
+    return (curve if return_curve else None), slope

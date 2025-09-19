@@ -72,6 +72,9 @@ class EvalConfig:
     scatter_samples  : int   = 500
     scatter_batch    : int   = 64
 
+    #batch-size
+    batch_size       : int   = 64
+
 
 # ====================================================================
 # 2 · Head scatter collector
@@ -322,7 +325,7 @@ def evaluate_mode(
         lnn = LNN(input_dim=2, hidden_dim=256).to(device); lnn.load_state_dict(lnn_sd, strict=True)
 
     # 3) -------- fixed evaluation DataLoader ------------------------
-    eval_loader = DataLoader(dataset, batch_size=64, shuffle=False)
+    eval_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
 
     # 4) -------- latent rollout -------------------------------------
     θ, ω, _ = rollout(
