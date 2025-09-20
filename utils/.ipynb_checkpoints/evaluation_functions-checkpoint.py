@@ -37,13 +37,8 @@ from sklearn.linear_model import LinearRegression          # linear-fit
 # --------------------------------------------------------------------
 from utils.models              import VJEPA, HNN, LNN                # NN classes
 from utils.loading_functions   import load_components                # ckpt splitter
-from utils.evaluation_metrics  import ( neighbour_divergence,
-                                   energy_drift,
-                                   el_residual_metric,
-                                   neighbour_divergence_curve,
-                                   energy_drift_curve,
-                                   el_residual_curve)        # metric fns
-from utils.helper_functions    import rollout                        # latent rollout
+from utils.evaluation_metrics  import *
+from utils.helper_functions    import *                        # latent rollout
 
 # CUDA if available, otherwise CPU
 device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -169,39 +164,17 @@ def evaluate_mode(
     *,
     combine           : str | tuple[str, float] | None = None,
     plot_head_scatter : bool = False,
-    save_curves       : bool = False,          # ← NEW FLAG
+    save_curves       : bool = False,
 ) -> Dict[str, float]:
-    """
-    Inference + physics metrics for one checkpoint.
 
-    Parameters
-    ----------
-    …
-    save_curves
-        If **True**, also dump the full per-step curves
-        ``Δ_curve``, ``E_curve`` and (when LNN present) ``EL_curve`` to
-        the output JSON.  Beware: curves are length ≈ `cfg.horizon` and
-        stored as full-precision floats, so the file grows linearly with
-        horizon.
-
-    Returns
-    -------
-    Dict[str, float]
-        Keys:
-            Δ_div, E_drift, EL_res (if LNN),
-            Δ_rate, E_rate, EL_rate (if LNN),
-            (optionally the three *_curve lists)
-            + latent-head regression stats.
-    """
-    # 1) -------- load state-dicts -----------------------------------
+    # 1) load components (unchanged)
     v_sd, t_sd, hnn_sd, lnn_sd = load_components(
         mode, suffix=cfg.suffix, base_dir=cfg.model_dir)
 
-    # 2) -------- rebuild modules & weights --------------------------
     model = VJEPA(embed_dim=384, depth=6, num_heads=6).to(device)
     head  = torch.nn.Linear(384, 2).to(device)
     model.load_state_dict(v_sd, strict=True)
-    head .load_state_dict(t_sd, strict=True)
+    head .load_state_dict(t_sd,  strict=True)
 
     hnn = lnn = None
     if hnn_sd:
@@ -209,62 +182,72 @@ def evaluate_mode(
     if lnn_sd:
         lnn = LNN(input_dim=2, hidden_dim=256).to(device); lnn.load_state_dict(lnn_sd, strict=True)
 
-    # 3) -------- fixed evaluation DataLoader ------------------------
+    # 2) deterministic eval loader
     eval_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
 
-    # 4) -------- latent rollout -------------------------------------
-    θ, ω, _ = rollout(
-        model, head,
-        hnn         = hnn,
-        lnn         = lnn,
-        combine     = combine,
-        horizon     = cfg.horizon,
-        dt          = cfg.dt,
-        eval_loader = eval_loader
+    # 3) NEW: per-frame preds and rollout from t=0
+    θ_img, ω_img, θ_roll, ω_roll, α_roll = rollout_align_with_goal(
+        vjepa=model, head=head,
+        eval_loader=eval_loader,
+        horizon=cfg.horizon, dt=cfg.dt,
+        hnn=hnn, lnn=lnn, combine=combine,
+        integrator="verlet",        # better long-term stability
+        context_mode="t0",          # mirror training context cheaply
     )
 
-    # 5) -------- base physics metrics -------------------------------
+    # 4) Gather ground-truth aligned with loader order
+    θ_true_list, ω_true_list = [], []
+    for _, states in eval_loader:
+        θ_true_list.append(states[:, :θ_img.shape[1], 0])
+        ω_true_list.append(states[:, :ω_img.shape[1], 1])
+    θ_true = torch.cat(θ_true_list, 0).cpu()
+    ω_true = torch.cat(ω_true_list, 0).cpu()
+
+    # 5) Physics metrics (use rollout)
     metrics: Dict[str, float] = {
-        "Δ_div"  : neighbour_divergence(θ, ω),
-        "E_drift": energy_drift(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l),
+        "Δ_div"  : neighbour_divergence(θ_roll, ω_roll),
+        "E_drift": energy_drift(θ_roll, ω_roll, m=cfg.m, g=cfg.g, l=cfg.l),
     }
     if lnn is not None:
-        metrics["EL_res"] = el_residual_metric(lnn, θ, ω, dt=cfg.dt)
+        metrics["EL_res"] = el_residual_metric(lnn, θ_roll, ω_roll, dt=cfg.dt)
 
-    # 6) -------- per-step curves + rates ----------------------------
-    Δ_curve, Δ_rate = neighbour_divergence_curve(θ, ω)
-    E_curve, E_rate = energy_drift_curve(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l)
+    Δ_curve, Δ_rate = neighbour_divergence_curve(θ_roll, ω_roll, return_curve=True)
+    E_curve, E_rate = energy_drift_curve(θ_roll, ω_roll, m=cfg.m, g=cfg.g, l=cfg.l, return_curve=True)
     metrics.update(Δ_rate=Δ_rate, E_rate=E_rate)
 
     if lnn is not None:
-        EL_curve, EL_rate = el_residual_curve(lnn, θ, ω, dt=cfg.dt)
+        EL_curve, EL_rate = el_residual_curve(lnn, θ_roll, ω_roll, dt=cfg.dt, return_curve=True)
         metrics["EL_rate"] = EL_rate
 
     if save_curves:
-        # keep JSON (back-compat)
-        metrics["Δ_curve"] = Δ_curve.tolist()
-        metrics["E_curve"] = E_curve.tolist()
+        metrics["Δ_curve"]  = Δ_curve.tolist()
+        metrics["E_curve"]  = E_curve.tolist()
         if lnn is not None:
             metrics["EL_curve"] = EL_curve.tolist()
-    
-        # add compact sidecar
-        curves_path = os.path.join(cfg.out_dir, f"curves_{mode}{cfg.suffix}.npz")
-        np.savez_compressed(
-            curves_path,
-            delta_curve=np.asarray(Δ_curve, dtype=np.float32),
-            energy_curve=np.asarray(E_curve, dtype=np.float32),
-            **({"el_curve": np.asarray(EL_curve, dtype=np.float32)} if lnn is not None else {})
-        )
-        metrics["curves_npz"] = curves_path  # tiny pointer in JSON
 
-    # 7) -------- latent-head diagnostics ---------------------------
+    # 6) NEW: per-frame image→latent metrics (central claim)
+    metrics.update(perframe_img_metrics(θ_true, ω_true, θ_img, ω_img))
+
+    # 7) NEW: rollout-vs-truth MSE (for completeness)
+    metrics.update(rollout_mse(θ_true, ω_true, θ_roll, ω_roll))
+
+    # 8) NEW: one-step self-consistency (local physics vs encoder)
+    metrics.update(one_step_consistency(
+        θ_img, ω_img, dt=cfg.dt, hnn=hnn, lnn=lnn, combine=(combine or "hnn"),
+        integrator="verlet"
+    ))
+
+    # 9) Optional: acceleration MSE vs analytic (uses rollout α)
+    metrics["accel_mse_true"] = accel_mse(θ_true, α_roll, g=cfg.g, l=cfg.l)
+
+    # 10) Existing head-scatter diagnostic (frame-0 only) – keep as-is
     θ_t, ω_t, θ_p, ω_p = collect_head_scatter(
         model, head, dataset,
         n_samples=cfg.scatter_samples,
         batch    =cfg.scatter_batch)
     metrics.update(head_regression_metrics(θ_t, ω_t, θ_p, ω_p))
 
-    # 8) -------- optional scatter plot -----------------------------
+    # 11) -------- optional scatter plot -----------------------------
     if plot_head_scatter:
         plt.figure(figsize=(10, 5))
         # θ
@@ -282,7 +265,8 @@ def evaluate_mode(
         plt.suptitle(f"Head predictions vs truth – {mode}")
         plt.tight_layout(); plt.show()
 
-    # 9) -------- write JSON ----------------------------------------
+
+    # 12) Save JSON (unchanged)
     os.makedirs(cfg.out_dir, exist_ok=True)
     out_path = os.path.join(cfg.out_dir, f"metrics_{mode}{cfg.suffix}.json")
     with open(out_path, "w") as fp:
@@ -291,6 +275,135 @@ def evaluate_mode(
     print(f"{mode:8} →", {k: round(v, 4) if isinstance(v, float) else '…' for k, v in metrics.items()},
           f"(saved → {out_path})")
     return metrics
+# def evaluate_mode(
+#     mode       : str,
+#     dataset,
+#     cfg        : EvalConfig,
+#     *,
+#     combine           : str | tuple[str, float] | None = None,
+#     plot_head_scatter : bool = False,
+#     save_curves       : bool = False,          # ← NEW FLAG
+# ) -> Dict[str, float]:
+#     """
+#     Inference + physics metrics for one checkpoint.
+
+#     Parameters
+#     ----------
+#     …
+#     save_curves
+#         If **True**, also dump the full per-step curves
+#         ``Δ_curve``, ``E_curve`` and (when LNN present) ``EL_curve`` to
+#         the output JSON.  Beware: curves are length ≈ `cfg.horizon` and
+#         stored as full-precision floats, so the file grows linearly with
+#         horizon.
+
+#     Returns
+#     -------
+#     Dict[str, float]
+#         Keys:
+#             Δ_div, E_drift, EL_res (if LNN),
+#             Δ_rate, E_rate, EL_rate (if LNN),
+#             (optionally the three *_curve lists)
+#             + latent-head regression stats.
+#     """
+#     # 1) -------- load state-dicts -----------------------------------
+#     v_sd, t_sd, hnn_sd, lnn_sd = load_components(
+#         mode, suffix=cfg.suffix, base_dir=cfg.model_dir)
+
+#     # 2) -------- rebuild modules & weights --------------------------
+#     model = VJEPA(embed_dim=384, depth=6, num_heads=6).to(device)
+#     head  = torch.nn.Linear(384, 2).to(device)
+#     model.load_state_dict(v_sd, strict=True)
+#     head .load_state_dict(t_sd, strict=True)
+
+#     hnn = lnn = None
+#     if hnn_sd:
+#         hnn = HNN(hidden_dim=256).to(device); hnn.load_state_dict(hnn_sd, strict=True)
+#     if lnn_sd:
+#         lnn = LNN(input_dim=2, hidden_dim=256).to(device); lnn.load_state_dict(lnn_sd, strict=True)
+
+#     # 3) -------- fixed evaluation DataLoader ------------------------
+#     eval_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
+
+#     # 4) -------- latent rollout -------------------------------------
+#     θ, ω, _ = rollout(
+#         model, head,
+#         hnn         = hnn,
+#         lnn         = lnn,
+#         combine     = combine,
+#         horizon     = cfg.horizon,
+#         dt          = cfg.dt,
+#         eval_loader = eval_loader
+#     )
+
+#     # 5) -------- base physics metrics -------------------------------
+#     metrics: Dict[str, float] = {
+#         "Δ_div"  : neighbour_divergence(θ, ω),
+#         "E_drift": energy_drift(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l),
+#     }
+#     if lnn is not None:
+#         metrics["EL_res"] = el_residual_metric(lnn, θ, ω, dt=cfg.dt)
+
+#     # 6) -------- per-step curves + rates ----------------------------
+#     Δ_curve, Δ_rate = neighbour_divergence_curve(θ, ω)
+#     E_curve, E_rate = energy_drift_curve(θ, ω, m=cfg.m, g=cfg.g, l=cfg.l)
+#     metrics.update(Δ_rate=Δ_rate, E_rate=E_rate)
+
+#     if lnn is not None:
+#         EL_curve, EL_rate = el_residual_curve(lnn, θ, ω, dt=cfg.dt)
+#         metrics["EL_rate"] = EL_rate
+
+#     if save_curves:
+#         # keep JSON (back-compat)
+#         metrics["Δ_curve"] = Δ_curve.tolist()
+#         metrics["E_curve"] = E_curve.tolist()
+#         if lnn is not None:
+#             metrics["EL_curve"] = EL_curve.tolist()
+    
+#         # add compact sidecar
+#         curves_path = os.path.join(cfg.out_dir, f"curves_{mode}{cfg.suffix}.npz")
+#         np.savez_compressed(
+#             curves_path,
+#             delta_curve=np.asarray(Δ_curve, dtype=np.float32),
+#             energy_curve=np.asarray(E_curve, dtype=np.float32),
+#             **({"el_curve": np.asarray(EL_curve, dtype=np.float32)} if lnn is not None else {})
+#         )
+#         metrics["curves_npz"] = curves_path  # tiny pointer in JSON
+
+#     # 7) -------- latent-head diagnostics ---------------------------
+#     θ_t, ω_t, θ_p, ω_p = collect_head_scatter(
+#         model, head, dataset,
+#         n_samples=cfg.scatter_samples,
+#         batch    =cfg.scatter_batch)
+#     metrics.update(head_regression_metrics(θ_t, ω_t, θ_p, ω_p))
+
+#     # 8) -------- optional scatter plot -----------------------------
+#     if plot_head_scatter:
+#         plt.figure(figsize=(10, 5))
+#         # θ
+#         plt.subplot(1, 2, 1)
+#         plt.scatter(θ_t, θ_p, s=8, alpha=.6)
+#         plt.xlabel("true θ"); plt.ylabel("pred θ")
+#         plt.grid(True); plt.xlim(-4, 4); plt.ylim(-4, 4)
+#         plt.gca().set_aspect("equal", adjustable="box")
+#         # ω
+#         plt.subplot(1, 2, 2)
+#         plt.scatter(ω_t, ω_p, s=8, alpha=.6)
+#         plt.xlabel("true ω"); plt.ylabel("pred ω")
+#         plt.grid(True); plt.xlim(-10, 10); plt.ylim(-10, 10)
+#         plt.gca().set_aspect("equal", adjustable="box")
+#         plt.suptitle(f"Head predictions vs truth – {mode}")
+#         plt.tight_layout(); plt.show()
+
+#     # 9) -------- write JSON ----------------------------------------
+#     os.makedirs(cfg.out_dir, exist_ok=True)
+#     out_path = os.path.join(cfg.out_dir, f"metrics_{mode}{cfg.suffix}.json")
+#     with open(out_path, "w") as fp:
+#         json.dump(metrics, fp, indent=2)
+
+#     print(f"{mode:8} →", {k: round(v, 4) if isinstance(v, float) else '…' for k, v in metrics.items()},
+#           f"(saved → {out_path})")
+#     return metrics
 # ====================================================================
 # 5 · Evaluate *many* modes (auto-detects whether fusion is possible)
 # ====================================================================

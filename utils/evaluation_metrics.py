@@ -42,6 +42,7 @@ from sklearn.linear_model  import LinearRegression
 from sklearn.metrics       import r2_score, mean_squared_error
 from typing                 import Dict, Tuple
 import torch.linalg as LA
+from utils.helper_functions import *
 # ---------------------------------------------------------------------
 # Physical defaults (override via function kwargs for other setups)
 # ---------------------------------------------------------------------
@@ -827,3 +828,120 @@ def el_residual_curve(
         slope = float(((curve - curve.mean()).dot(t - t.mean())) / denom)
 
     return (curve if return_curve else None), slope
+
+# --- Per-frame image→latent regression metrics across ALL frames ----
+def perframe_img_metrics(θ_true, ω_true, θ_img, ω_img) -> Dict[str, float]:
+    """
+    Aggregate regression metrics across all N*T predictions.
+    Inputs: torch Tensors (N,T) on CPU.
+    """
+    import numpy as np
+    from sklearn.metrics import r2_score, mean_squared_error
+
+    θt = θ_true.numpy().reshape(-1)
+    ωt = ω_true.numpy().reshape(-1)
+    θp = θ_img.numpy().reshape(-1)
+    ωp = ω_img.numpy().reshape(-1)
+
+    return dict(
+        r2_theta_img  = float(r2_score(θt, θp)),
+        mse_theta_img = float(mean_squared_error(θt, θp)),
+        r2_omega_img  = float(r2_score(ωt, ωp)),
+        mse_omega_img = float(mean_squared_error(ωt, ωp)),
+    )
+
+# --- Rollout vs ground-truth MSE over ALL frames --------------------
+def rollout_mse(θ_true, ω_true, θ_roll, ω_roll) -> Dict[str, float]:
+    errθ = torch.mean((θ_roll - θ_true)**2).item()
+    errω = torch.mean((ω_roll - ω_true)**2).item()
+    return dict(mse_theta_roll=errθ, mse_omega_roll=errω)
+
+# --- One-step self-consistency:  roll from (θ_img[t],ω_img[t]) and
+#     compare to (θ_img[t+1], ω_img[t+1]) -----------------------------
+def one_step_consistency(
+    θ_img: torch.Tensor, ω_img: torch.Tensor, *,
+    dt: float, hnn=None, lnn=None, combine="hnn", integrator="verlet"
+) -> Dict[str, float]:
+    """
+    Measures whether the learned latent dynamics agree with the encoder’s
+    next-frame predictions. Lower is better.
+    Works regardless of where θ_img/ω_img live (CPU/GPU).
+    """
+    # ---- choose the working device ----
+    if hnn is not None:
+        dev = next(hnn.parameters()).device
+    elif lnn is not None:
+        dev = next(lnn.parameters()).device
+    else:
+        dev = θ_img.device  # no physics nets: stay where we are
+
+    # move copies to the physics device
+    θ = θ_img.to(dev)
+    ω = ω_img.to(dev)
+
+    # local accel helper: ALWAYS build inputs on `dev`
+    def _accel(q, v):
+        with torch.set_grad_enabled(True):
+            if combine == "hnn" and (hnn is not None):
+                x = torch.stack([q, v], dim=1).to(dev).requires_grad_(True)
+                td = hnn.time_derivative(x)
+                return td[:, 1] if (td.ndim == 2 and td.size(-1) >= 2) else td.reshape(-1)
+            if combine == "lnn" and (lnn is not None):
+                return lnn_accel(lnn, q.to(dev), v.to(dev), dt=dt)
+            if combine == "mean" and (hnn is not None) and (lnn is not None):
+                x = torch.stack([q, v], dim=1).to(dev).requires_grad_(True)
+                td = hnn.time_derivative(x)
+                a_h = td[:, 1] if (td.ndim == 2 and td.size(-1) >= 2) else td.reshape(-1)
+                a_l = lnn_accel(lnn, q.to(dev), v.to(dev), dt=dt)
+                return 0.5 * (a_h + a_l)
+            if isinstance(combine, tuple) and combine[0] == "blend" and (hnn is not None) and (lnn is not None):
+                w = float(combine[1])
+                x = torch.stack([q, v], dim=1).to(dev).requires_grad_(True)
+                td = hnn.time_derivative(x)
+                a_h = td[:, 1] if (td.ndim == 2 and td.size(-1) >= 2) else td.reshape(-1)
+                a_l = lnn_accel(lnn, q.to(dev), v.to(dev), dt=dt)
+                return w * a_h + (1.0 - w) * a_l
+            # fallbacks
+            if hnn is not None:
+                x = torch.stack([q, v], dim=1).to(dev).requires_grad_(True)
+                td = hnn.time_derivative(x)
+                return td[:, 1] if (td.ndim == 2 and td.size(-1) >= 2) else td.reshape(-1)
+            if lnn is not None:
+                return lnn_accel(lnn, q.to(dev), v.to(dev), dt=dt)
+            return torch.zeros_like(v, device=dev)
+
+    N, T = θ.shape
+    if T < 2:
+        return dict(cons_theta_mse=0.0, cons_omega_mse=0.0)
+
+    q = θ[:, :-1].contiguous()
+    v = ω[:, :-1].contiguous()
+
+    qf_list, vf_list = [], []
+    for t in range(T - 1):
+        q_t = q[:, t].detach()
+        v_t = v[:, t].detach()
+        a_t = _accel(q_t, v_t)
+
+        if integrator == "euler":
+            q_next = q_t + v_t * dt
+            v_next = v_t + a_t * dt
+        else:
+            q_next = q_t + v_t * dt + 0.5 * a_t * (dt ** 2)
+            v_half = v_t + 0.5 * a_t * dt
+            a_next = _accel(q_next.detach(), v_half.detach())
+            v_next = v_half + 0.5 * a_next * dt
+
+        qf_list.append(q_next)
+        vf_list.append(v_next)
+
+    θ_one = torch.stack(qf_list, dim=1)            # (N, T-1) on dev
+    ω_one = torch.stack(vf_list, dim=1)            # (N, T-1) on dev
+
+    θ_target = θ[:, 1:]                            # (N, T-1) on dev
+    ω_target = ω[:, 1:]
+
+    return dict(
+        cons_theta_mse = torch.mean((θ_one - θ_target)**2).item(),
+        cons_omega_mse = torch.mean((ω_one - ω_target)**2).item(),
+    )
