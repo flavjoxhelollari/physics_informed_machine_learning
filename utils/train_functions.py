@@ -44,7 +44,7 @@ class TrainConfig:
 
     epochs     : int   = 10
     batch_size : int   = 32
-    lr         : float = 1e-4
+    lr         : float = 1e-4                     # base LR (encoder)
 
     img_size   : int   = 64
     patch_size : int   = 8
@@ -63,7 +63,7 @@ class TrainConfig:
     model_dir  : str   = "./models"
     log_dir    : str   = "./results_numpy"
 
-    # --- NEW: time step used for FD loss / rollout-consistency ---
+    # --- time step for FD / rollout-consistency ---
     dt         : float = 0.05
 
     # --- supervision ---
@@ -72,21 +72,27 @@ class TrainConfig:
     normalize_sup: bool = True
     B_OMEGA: float = 1.0
 
-    # --- NEW: FD-consistency & HNN target knobs (optional) ---
-    λ_fd: float = 0.0           # 0 disables FD consistency
-    fd_use_gt: bool = True      # use (θ_{t+1}-θ_t)/dt vs (θ̂_{t+1}-θ̂_t)/dt
+    # --- FD-consistency & HNN target knobs (optional) ---
+    λ_fd: float = 0.0                 # 0 disables FD consistency
+    fd_use_gt: bool = True            # use (θ_{t+1}-θ_t)/dt vs (θ̂_{t+1}-θ̂_t)/dt
     hnn_target: Literal["gt","pred"] = "gt"
 
-    # --- optimization ---
+    # --- optimization (encoder) ---
     weight_decay: float = 1e-4
     max_grad_norm: Optional[float] = None
     warmup_epochs: int = 1
     cosine_final_lr_ratio: float = 0.1
 
+    # --- NEW: head-specific optimizer knobs ---
+    lr_head: Optional[float] = None         # None → use 10× `lr` in code
+    head_weight_decay: float = 0.0          # heads typically no WD
+    head_warmup_epochs: int = 0             # damp/freeze encoder for first K epochs
+
     # --- EMA ---
     use_ema: bool = True
     ema_decay: float = 0.999
-    use_ema_head: bool = True   # applies to both heads now
+    use_ema_head: bool = True               # applies to theta head
+    use_ema_omega_head: bool = True         # NEW: applies to omega head
 
     @staticmethod
     def preset(mode: Literal["plain","hnn","lnn","hnn+lnn"]) -> "TrainConfig":
@@ -191,47 +197,59 @@ def train_one_epoch(
     λ_hnn: float,
     λ_sup: float,
     *,
-    dt: float,                      # NEW: Δt for FD target and ω head
+    dt: float,
     normalize_sup: bool = True,
     B_OMEGA: float = 1.0,
-    sup_use_frames: str = "first",  # "first" | "all" | "N"
-    sup_num_frames: int = 3,        # used only when "N"
-    λ_fd: float = 0.0,              # NEW: weight for FD consistency
-    fd_use_gt: bool = True,         # NEW: FD target uses GT vs model θ̂
-    hnn_target: Literal["gt","pred"] = "gt",  # NEW: what dθ/dt is matched to
+    sup_use_frames: str = "first",
+    sup_num_frames: int = 3,
+    λ_fd: float = 0.0,
+    fd_use_gt: bool = True,
+    hnn_target: Literal["gt","pred"] = "gt",
     max_grad_norm: float | None = None,
-    ema_updater: EMA | dict | None = None     # support {"encoder","theta_head","omega_head"}
+    ema_updater: EMA | dict | None = None,
+    # NEW: epoch-aware warmup for heads (freeze encoder)
+    epoch: int = 0,
+    head_warmup_epochs: int = 0,
 ) -> Dict[str, float]:
 
+    # Freeze encoder if within warmup
+    freeze_encoder = (epoch < max(0, int(head_warmup_epochs)))
+
+    # keep train() for layers that might exist on heads/physics nets
     model.train(); theta_head.train(); omega_head.train()
     if lnn: lnn.train()
     if hnn: hnn.train()
 
-    agg = dict(
-        jepa=0., lnn=0., hnn=0.,
-        sup=0., sup_theta=0., sup_omega=0., sup_fd=0.,
-        total=0.
-    )
+    agg = dict(jepa=0., lnn=0., hnn=0., sup=0., sup_theta=0., sup_omega=0., sup_fd=0., total=0.)
     THETA_SCALE, OMEGA_SCALE = math.pi, 5.0
+
+    # helper that runs the encoder with/without grad depending on freeze flag
+    def encode_frame(imgs: torch.Tensor) -> torch.Tensor:
+        if freeze_encoder:
+            with torch.no_grad():
+                return model.context_encoder(model.patch_embed(imgs) + model.pos_embed).mean(1)
+        else:
+            return model.context_encoder(model.patch_embed(imgs) + model.pos_embed).mean(1)
 
     for imgs_seq, states_seq in loader:
         imgs_seq   = imgs_seq.to(device)           # (B,T,3,H,W)
         states_seq = states_seq.to(device)         # (B,T,2)
-        B, T = imgs_seq.shape[0], imgs_seq.shape[1]
+        T = imgs_seq.size(1)
         idxs = _pick_supervision_frames(T, sup_use_frames, sup_num_frames)
 
-        θ_true = states_seq[:, :, 0:1]             # (B,T,1)
-        ω_true = states_seq[:, :, 1:2]             # (B,T,1)
+        θ_true = states_seq[:, :, 0:1]
+        ω_true = states_seq[:, :, 1:2]
 
-        # ------- JEPA pretext on frame 0 -------
-        imgs0 = imgs_seq[:, 0]
-        loss_jepa, _, _ = model(imgs0)
+        # ------- JEPA pretext on frame 0 (skip during head-warmup) -------
+        if freeze_encoder:
+            loss_jepa = torch.zeros((), device=device)
+        else:
+            imgs0 = imgs_seq[:, 0]
+            loss_jepa, _, _ = model(imgs0)
 
         # ------- cache latents z_t for used frames (and t+1 for ω) -------
         need = set(idxs) | {t+1 for t in idxs if t+1 < T}
-        z_cache: dict[int, torch.Tensor] = {}
-        for t in need:
-            z_cache[t] = _ctx(model, imgs_seq[:, t])   # (B,D)
+        z_cache: dict[int, torch.Tensor] = {t: encode_frame(imgs_seq[:, t]) for t in need}
 
         # ------- supervised θ/ω + FD consistency -------
         sup_theta = torch.zeros((), device=device)
@@ -246,18 +264,17 @@ def train_one_epoch(
             θ̂t = theta_head(zt)                    # (B,1)
             θhat_cache[t] = θ̂t
 
-            θt = θ_true[:, t]                      # (B,1)
+            θt = θ_true[:, t]
             if normalize_sup:
                 sup_theta = sup_theta + F.mse_loss(θ̂t / THETA_SCALE, θt / THETA_SCALE)
             else:
                 sup_theta = sup_theta + F.mse_loss(θ̂t, θt)
             nθ += 1
 
-            # ω supervision needs t+1
             if t + 1 < T:
                 zt1 = z_cache[t+1]
-                ω̂t  = omega_head(zt, zt1, dt=dt)  # (B,1)
-                ωt  = ω_true[:, t]                 # (B,1)
+                ω̂t  = omega_head(zt, zt1, dt=dt)   # (B,1)
+                ωt  = ω_true[:, t]
 
                 if normalize_sup:
                     sup_omega = sup_omega + F.mse_loss(ω̂t / OMEGA_SCALE, ωt / OMEGA_SCALE)
@@ -265,18 +282,15 @@ def train_one_epoch(
                     sup_omega = sup_omega + F.mse_loss(ω̂t, ωt)
                 nω += 1
 
-                # FD consistency
                 if λ_fd > 0.0:
                     if fd_use_gt:
-                        ω_fd = (θ_true[:, t+1] - θ_true[:, t]) / dt      # (B,1)
+                        ω_fd = (θ_true[:, t+1] - θ_true[:, t]) / dt
                     else:
-                        # need θ̂_{t+1}
                         if (t+1) not in θhat_cache:
                             θhat_cache[t+1] = theta_head(zt1)
                         ω_fd = (θhat_cache[t+1] - θ̂t) / dt
                     sup_fd = sup_fd + F.mse_loss(ω̂t, ω_fd)
 
-        # means
         if nθ > 0: sup_theta = sup_theta / nθ
         if nω > 0:
             sup_omega = sup_omega / nω
@@ -285,28 +299,31 @@ def train_one_epoch(
         sup_loss = sup_theta + B_OMEGA * sup_omega + λ_fd * sup_fd
 
         # ------- physics aux losses -------
-        # HNN: compare dθ/dt vs chosen target (GT or predicted ω̂)
         hnn_loss = torch.zeros((), device=device)
         if hnn and λ_hnn > 0:
-            z0  = z_cache.get(0, _ctx(model, imgs_seq[:, 0]))
-            z1  = z_cache.get(1, _ctx(model, imgs_seq[:, 1])) if T > 1 else z0
-            θ̂0 = theta_head(z0)                              # (B,1)
-            if hnn_target == "gt":
-                ω_tar = ω_true[:, 0]                          # (B,1)
-            else:
-                ω_tar = omega_head(z0, z1, dt=dt).detach()    # (B,1)  stop grad into ω-head here
+            # ensure these are computed with the same freeze policy
+            z0 = z_cache.get(0, encode_frame(imgs_seq[:, 0]))
+            z1 = z_cache.get(1, encode_frame(imgs_seq[:, 1])) if T > 1 else z0
+            θ̂0 = theta_head(z0)
 
-            x0 = torch.cat([θ̂0.detach(), ω_tar], dim=1).requires_grad_(True)  # (B,2) with grad
-            td = hnn.time_derivative(x0)                      # (B,2) or (B,1)
+            if hnn_target == "gt":
+                ω_tar = ω_true[:, 0]
+            else:
+                # stop grad into omega head here
+                with torch.no_grad() if freeze_encoder else torch.enable_grad():
+                    ω_tar = omega_head(z0.detach() if freeze_encoder else z0,
+                                       z1.detach() if freeze_encoder else z1,
+                                       dt=dt).detach()
+
+            x0 = torch.cat([θ̂0.detach(), ω_tar], dim=1).requires_grad_(True)
+            td = hnn.time_derivative(x0)
             dθdt = td[:, 0:1] if (td.ndim == 2 and td.size(-1) >= 2) else td.reshape(-1, 1)
             hnn_loss = F.mse_loss(dθdt, ω_tar)
 
-        # LNN: your residual over full (θ_true, ω_true) tensor
         lnn_loss = torch.zeros((), device=device)
         if lnn and λ_lnn > 0:
             lnn_loss = lnn.lagrangian_residual(θ_true, ω_true)
 
-        # ------- total & step -------
         loss = loss_jepa + λ_lnn * lnn_loss + λ_hnn * hnn_loss + λ_sup * sup_loss
 
         opt.zero_grad(set_to_none=True)
@@ -322,7 +339,7 @@ def train_one_epoch(
             )
         opt.step()
 
-        # ------- EMA updates (support dict or legacy single) -------
+        # EMA updates
         if ema_updater is not None:
             if isinstance(ema_updater, dict):
                 if ema_updater.get("encoder") is not None:
@@ -332,9 +349,9 @@ def train_one_epoch(
                 if ema_updater.get("omega_head") is not None:
                     ema_updater["omega_head"].update(omega_head)
             else:
-                ema_updater.update(model)  # legacy single-EMA-on-encoder
+                ema_updater.update(model)
 
-        # ------- logging -------
+        # logging
         agg["jepa"]      += loss_jepa.item()
         agg["lnn"]       += lnn_loss.item()
         agg["hnn"]       += hnn_loss.item()
@@ -344,7 +361,8 @@ def train_one_epoch(
         agg["sup_fd"]    += (sup_fd.item() if (λ_fd > 0 and nω > 0) else 0.0)
         agg["total"]     += loss.item()
 
-    for k in agg: agg[k] /= len(loader)
+    for k in agg:
+        agg[k] /= len(loader)
     return agg
 
 # ====================================================================
@@ -370,15 +388,44 @@ def run_mode(cfg: TrainConfig, dataloader: DataLoader) -> None:
     hnn = HNN(cfg.h_hidden).to(device) if cfg.λ_hnn > 0 else None
     lnn = LNN(2, cfg.l_hidden).to(device) if cfg.λ_lnn > 0 else None
 
-    # -------- optimizer (AdamW + WD) --------
-    params = (
-        list(model.parameters())
-        + list(theta_head.parameters())
-        + list(omega_head.parameters())
-        + ([] if hnn is None else list(hnn.parameters()))
-        + ([] if lnn is None else list(lnn.parameters()))
-    )
-    opt = optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # ---- build param groups -------------------------------------------------
+    enc_params    = list(model.parameters())                # VJEPA backbone
+    theta_params  = list(theta_head.parameters())
+    omega_params  = list(omega_head.parameters())
+    hnn_params    = list(hnn.parameters()) if hnn is not None else []
+    lnn_params    = list(lnn.parameters()) if lnn is not None else []
+    
+    # (optional) freeze any block by emptying its group or setting lr=0.0
+    lr_head   = getattr(cfg, "lr_head",   cfg.lr * 10.0)    # heads usually need higher LR
+    lr_hnn    = getattr(cfg, "lr_hnn",    cfg.lr)           # OK to start equal to encoder
+    lr_lnn    = getattr(cfg, "lr_lnn",    cfg.lr)
+    wd_head   = getattr(cfg, "head_weight_decay", 0.0)      # heads often with no WD
+    wd_hnn    = getattr(cfg, "hnn_weight_decay",  cfg.weight_decay)
+    wd_lnn    = getattr(cfg, "lnn_weight_decay",  cfg.weight_decay)
+    
+    param_groups = [
+        {"params": enc_params,   "lr": cfg.lr,   "weight_decay": cfg.weight_decay, "name": "encoder"},
+        {"params": theta_params, "lr": lr_head,  "weight_decay": wd_head,          "name": "theta_head"},
+        {"params": omega_params, "lr": lr_head,  "weight_decay": wd_head,          "name": "omega_head"},
+    ]
+    
+    if hnn_params:
+        param_groups.append({"params": hnn_params, "lr": lr_hnn, "weight_decay": wd_hnn, "name": "hnn"})
+    if lnn_params:
+        param_groups.append({"params": lnn_params, "lr": lr_lnn, "weight_decay": wd_lnn, "name": "lnn"})
+    
+    # Filter out empty groups just in case
+    param_groups = [g for g in param_groups if len(g["params"]) > 0]
+    
+    # ---- optimizer ----------------------------------------------------------
+    opt = optim.AdamW(param_groups)
+    
+    # (optional) tiny print to sanity-check which groups are being optimized
+    def _count_params(ps): 
+        return sum(p.numel() for p in ps if p.requires_grad)
+    for g in param_groups:
+        print(f"[opt] {g['name']:11s}  lr={g['lr']:.2e}  wd={g['weight_decay']:.2e}  "
+              f"params={_count_params(g['params'])}")
 
     # -------- cosine LR with warmup --------
     total_epochs = cfg.epochs
@@ -391,6 +438,10 @@ def run_mode(cfg: TrainConfig, dataloader: DataLoader) -> None:
     ema_encoder    = EMA(model,       decay=cfg.ema_decay) if cfg.use_ema else None
     ema_theta_head = EMA(theta_head,  decay=cfg.ema_decay) if (cfg.use_ema and cfg.use_ema_head) else None
     ema_omega_head = EMA(omega_head,  decay=cfg.ema_decay) if (cfg.use_ema and getattr(cfg, "use_ema_omega_head", True)) else None
+
+    base_lr_enc   = cfg.lr
+    base_lr_head  = getattr(cfg, "lr_head", cfg.lr*10)
+    warm_ep       = getattr(cfg, "head_warmup_epochs", 0)
 
     rows: List[Dict[str, float]] = []
     for ep in range(cfg.epochs):
@@ -410,20 +461,22 @@ def run_mode(cfg: TrainConfig, dataloader: DataLoader) -> None:
             λ_lnn=cfg.λ_lnn,
             λ_hnn=cfg.λ_hnn,
             λ_sup=cfg.λ_sup,
-            dt=cfg.dt,                             # NEW
+            dt=cfg.dt,
             normalize_sup=cfg.normalize_sup,
             B_OMEGA=cfg.B_OMEGA,
             sup_use_frames=cfg.sup_use_frames,
             sup_num_frames=cfg.sup_num_frames,
-            λ_fd=getattr(cfg, "λ_fd", 0.0),        # NEW
-            fd_use_gt=getattr(cfg, "fd_use_gt", True),
-            hnn_target=getattr(cfg, "hnn_target", "gt"),
+            λ_fd=cfg.λ_fd,
+            fd_use_gt=cfg.fd_use_gt,
+            hnn_target=cfg.hnn_target,
             max_grad_norm=cfg.max_grad_norm,
             ema_updater={
                 "encoder":    ema_encoder,
                 "theta_head": ema_theta_head,
                 "omega_head": ema_omega_head,
             },
+            epoch=ep,                                 # ← NEW
+            head_warmup_epochs=cfg.head_warmup_epochs # ← NEW
         )
 
         rows.append({"epoch": ep+1, "lr": opt.param_groups[0]["lr"], **loss_d})

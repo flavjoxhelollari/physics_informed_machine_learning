@@ -337,61 +337,175 @@ def lnn_accel(
 
 #     return torch.cat(θ_buf).cpu(), torch.cat(ω_buf).cpu(), torch.cat(α_buf).cpu()
 
+# @torch.no_grad()
+# def rollout(
+#     vjepa,
+#     head,
+#     *,
+#     eval_loader,                   # deterministic grid
+#     horizon   : int,
+#     dt        : float,
+#     hnn       = None,
+#     lnn       = None,
+#     combine   : str | tuple[str, float] | None = None
+# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#     """
+#     Integration in latent (θ, ω) space with optional learned acceleration.
+
+#     Parameters
+#     ----------
+#     hnn, lnn
+#         Instances or *None* – may supply **one or both**.
+#     combine
+#         Behaviour when *both* nets are supplied:
+
+#         * ``None``      → pick whichever net is available (HNN ≻ LNN)
+#         * ``"hnn"``     → ignore LNN, use HNN
+#         * ``"lnn"``     → ignore HNN, use LNN
+#         * ``"mean"``    → α = ½(α_HNN + α_LNN)
+#         * ``"sum"``     → α = α_HNN + α_LNN
+#         * ``("blend", w)`` → weighted mix 0 ≤ w ≤ 1
+#     """
+#     def _hnn_accel_from_td(hnn, q, v):
+#         """
+#         Returns acceleration from an HNN time_derivative() that might output:
+#           - (B,2): [dq/dt, dv/dt]  -> take column 1
+#           - (B,1) or (B,) : acceleration directly
+#         q,v can be (B,), (B,1), or scalars; we normalize to (B,).
+#         """
+#         # normalize q,v -> (B,)
+#         q = q.reshape(-1)
+#         v = v.reshape(-1)
+    
+#         x = torch.stack([q, v], dim=1).requires_grad_(True)  # (B,2)
+#         td = hnn.time_derivative(x)                          # (B,2) or (B,1)/(B,)
+    
+#         if td.ndim == 2 and td.size(-1) >= 2:
+#             α = td[:, 1]             # dv/dt
+#         else:
+#             α = td.reshape(-1)       # accel-only
+#         return α
+    
+#     if horizon < 2:
+#         raise ValueError("horizon must be ≥ 2")
+
+#     # --------------- sanity on combine spec -------------------------
+#     if combine is None:
+#         picker = "hnn" if hnn is not None else "lnn"          # auto-pick
+#     elif combine in {"hnn", "lnn", "mean", "sum"}:
+#         picker = combine
+#     elif isinstance(combine, tuple) and combine[0] == "blend":
+#         picker = ("blend", float(combine[1]))
+#     else:
+#         raise ValueError(f"rollout(): unknown combine spec {combine!r}")
+
+#     # ensure nets in eval
+#     vjepa.eval(); head.eval()
+#     if hnn: hnn.eval()
+#     if lnn: lnn.eval()
+
+#     θ_buf, ω_buf, α_buf = [], [], []
+
+#     for seq, _ in tqdm.tqdm(eval_loader, desc="rollout", leave=False):
+#         imgs0 = seq[:, 0].to(device)
+
+#         # latent → initial θ, ω
+#         z0 = vjepa.context_encoder(
+#                  vjepa.patch_embed(imgs0) + vjepa.pos_embed).mean(1)
+#         θ, ω = head(z0).split(1, dim=1)   # (B,1), (B,1)
+#         θ, ω = θ.squeeze(1), ω.squeeze(1) # (B,), (B,)
+
+#         Θ, Ω, Α = [θ], [ω], []
+
+#         for _ in range(horizon - 1):
+#             q, v = Θ[-1].detach(), Ω[-1].detach()
+
+#             # ---------------- choose / fuse acceleration ------------
+#             if (picker == "hnn") and (hnn is not None):
+#                 with torch.set_grad_enabled(True):
+#                     α = _hnn_accel_from_td(hnn, q, v)
+
+#             elif (picker == "lnn") and (lnn is not None):
+#                 with torch.set_grad_enabled(True):
+#                     α = lnn_accel(lnn, q, v, dt=dt)
+
+#             elif (picker == "mean") and (hnn is not None) and (lnn is not None):
+#                 with torch.set_grad_enabled(True):
+#                     α_h = _hnn_accel_from_td(hnn, q, v)
+#                     α_l = lnn_accel(lnn, q, v, dt=dt)
+#                     α   = 0.5 * (α_h + α_l)
+
+#             elif (picker == "sum") and (hnn is not None) and (lnn is not None):
+#                 with torch.set_grad_enabled(True):
+#                     α_h = _hnn_accel_from_td(hnn, q, v)
+#                     α_l = lnn_accel(lnn, q, v, dt=dt)
+#                     α   = α_h + α_l
+
+#             elif isinstance(picker, tuple) and picker[0] == "blend" \
+#                  and (hnn is not None) and (lnn is not None):
+#                 w = float(picker[1])
+#                 with torch.set_grad_enabled(True):
+#                     α_h = _hnn_accel_from_td(hnn, q, v)
+#                     α_l = lnn_accel(lnn, q, v, dt=dt)
+#                     α   = w * α_h + (1.0 - w) * α_l
+
+#             else:
+#                 # fallback: if requested fuse not possible, choose available net
+#                 if hnn is not None:
+#                     with torch.set_grad_enabled(True):
+#                         α = _hnn_accel_from_td(hnn, q, v)
+#                 elif lnn is not None:
+#                     with torch.set_grad_enabled(True):
+#                         α = lnn_accel(lnn, q, v, dt=dt)
+#                 else:
+#                     α = torch.zeros_like(v)
+
+#             # ---------------- Euler update ---------------------------
+#             Θ.append(q + v * dt)
+#             Ω.append(v + α * dt)
+#             Α.append(α)
+
+#         Α = [torch.zeros_like(Α[0])] + Α          # prepend α₀ = 0
+#         θ_buf.append(torch.stack(Θ, 1))
+#         ω_buf.append(torch.stack(Ω, 1))
+#         α_buf.append(torch.stack(Α, 1))
+
+#     return torch.cat(θ_buf).cpu(), torch.cat(ω_buf).cpu(), torch.cat(α_buf).cpu()
+
 @torch.no_grad()
 def rollout(
     vjepa,
-    head,
+    head,                                 # legacy combined head (384→2) or None
     *,
-    eval_loader,                   # deterministic grid
-    horizon   : int,
-    dt        : float,
-    hnn       = None,
-    lnn       = None,
-    combine   : str | tuple[str, float] | None = None
+    eval_loader,
+    horizon: int,
+    dt: float,
+    hnn=None,
+    lnn=None,
+    combine=None,
+    # NEW: optional separate heads
+    theta_head_1f: torch.nn.Module | None = None,   # 384→1
+    omega_head_2f: torch.nn.Module | None = None,   # 768→1
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Integration in latent (θ, ω) space with optional learned acceleration.
-
-    Parameters
-    ----------
-    hnn, lnn
-        Instances or *None* – may supply **one or both**.
-    combine
-        Behaviour when *both* nets are supplied:
-
-        * ``None``      → pick whichever net is available (HNN ≻ LNN)
-        * ``"hnn"``     → ignore LNN, use HNN
-        * ``"lnn"``     → ignore HNN, use LNN
-        * ``"mean"``    → α = ½(α_HNN + α_LNN)
-        * ``"sum"``     → α = α_HNN + α_LNN
-        * ``("blend", w)`` → weighted mix 0 ≤ w ≤ 1
+    If theta_head_1f & omega_head_2f are provided, use:
+      θ0 = theta_head_1f(z0) from frame-0
+      ω0 = omega_head_2f([z0 ⊕ z1]) from frames (0,1)
+    Otherwise fall back to legacy: head(z0) → (θ0, ω0).
+    Integration (θ, ω) uses α from HNN/LNN exactly as before.
     """
     def _hnn_accel_from_td(hnn, q, v):
-        """
-        Returns acceleration from an HNN time_derivative() that might output:
-          - (B,2): [dq/dt, dv/dt]  -> take column 1
-          - (B,1) or (B,) : acceleration directly
-        q,v can be (B,), (B,1), or scalars; we normalize to (B,).
-        """
-        # normalize q,v -> (B,)
-        q = q.reshape(-1)
-        v = v.reshape(-1)
-    
-        x = torch.stack([q, v], dim=1).requires_grad_(True)  # (B,2)
-        td = hnn.time_derivative(x)                          # (B,2) or (B,1)/(B,)
-    
-        if td.ndim == 2 and td.size(-1) >= 2:
-            α = td[:, 1]             # dv/dt
-        else:
-            α = td.reshape(-1)       # accel-only
-        return α
-    
+        q = q.reshape(-1); v = v.reshape(-1)
+        x = torch.stack([q, v], dim=1).requires_grad_(True)
+        td = hnn.time_derivative(x)
+        return td[:, 1] if (td.ndim == 2 and td.size(-1) >= 2) else td.reshape(-1)
+
     if horizon < 2:
         raise ValueError("horizon must be ≥ 2")
 
-    # --------------- sanity on combine spec -------------------------
+    # choose accel source (unchanged)
     if combine is None:
-        picker = "hnn" if hnn is not None else "lnn"          # auto-pick
+        picker = "hnn" if hnn is not None else "lnn"
     elif combine in {"hnn", "lnn", "mean", "sum"}:
         picker = combine
     elif isinstance(combine, tuple) and combine[0] == "blend":
@@ -399,8 +513,10 @@ def rollout(
     else:
         raise ValueError(f"rollout(): unknown combine spec {combine!r}")
 
-    # ensure nets in eval
-    vjepa.eval(); head.eval()
+    vjepa.eval()
+    if head is not None: head.eval()
+    if theta_head_1f is not None: theta_head_1f.eval()
+    if omega_head_2f is not None: omega_head_2f.eval()
     if hnn: hnn.eval()
     if lnn: lnn.eval()
 
@@ -408,49 +524,40 @@ def rollout(
 
     for seq, _ in tqdm.tqdm(eval_loader, desc="rollout", leave=False):
         imgs0 = seq[:, 0].to(device)
+        z0 = vjepa.context_encoder(vjepa.patch_embed(imgs0) + vjepa.pos_embed).mean(1)  # (B,D)
 
-        # latent → initial θ, ω
-        z0 = vjepa.context_encoder(
-                 vjepa.patch_embed(imgs0) + vjepa.pos_embed).mean(1)
-        θ, ω = head(z0).split(1, dim=1)   # (B,1), (B,1)
-        θ, ω = θ.squeeze(1), ω.squeeze(1) # (B,), (B,)
+        if (theta_head_1f is not None) and (omega_head_2f is not None) and (seq.size(1) >= 2):
+            imgs1 = seq[:, 1].to(device)
+            z1 = vjepa.context_encoder(vjepa.patch_embed(imgs1) + vjepa.pos_embed).mean(1)
+            θ0 = theta_head_1f(z0).squeeze(1)                           # (B,)
+            ω0 = omega_head_2f(torch.cat([z0, z1], dim=1)).squeeze(1)   # (B,)
+        else:
+            # legacy combined head
+            assert head is not None, "rollout needs either (head) or (theta_head_1f & omega_head_2f)"
+            θ0, ω0 = head(z0).split(1, dim=1)
+            θ0, ω0 = θ0.squeeze(1), ω0.squeeze(1)
 
-        Θ, Ω, Α = [θ], [ω], []
+        Θ, Ω, Α = [θ0], [ω0], []
 
         for _ in range(horizon - 1):
             q, v = Θ[-1].detach(), Ω[-1].detach()
-
-            # ---------------- choose / fuse acceleration ------------
             if (picker == "hnn") and (hnn is not None):
                 with torch.set_grad_enabled(True):
                     α = _hnn_accel_from_td(hnn, q, v)
-
             elif (picker == "lnn") and (lnn is not None):
                 with torch.set_grad_enabled(True):
                     α = lnn_accel(lnn, q, v, dt=dt)
-
             elif (picker == "mean") and (hnn is not None) and (lnn is not None):
                 with torch.set_grad_enabled(True):
-                    α_h = _hnn_accel_from_td(hnn, q, v)
-                    α_l = lnn_accel(lnn, q, v, dt=dt)
-                    α   = 0.5 * (α_h + α_l)
-
+                    α = 0.5 * (_hnn_accel_from_td(hnn, q, v) + lnn_accel(lnn, q, v, dt=dt))
             elif (picker == "sum") and (hnn is not None) and (lnn is not None):
                 with torch.set_grad_enabled(True):
-                    α_h = _hnn_accel_from_td(hnn, q, v)
-                    α_l = lnn_accel(lnn, q, v, dt=dt)
-                    α   = α_h + α_l
-
-            elif isinstance(picker, tuple) and picker[0] == "blend" \
-                 and (hnn is not None) and (lnn is not None):
+                    α = _hnn_accel_from_td(hnn, q, v) + lnn_accel(lnn, q, v, dt=dt)
+            elif isinstance(picker, tuple) and picker[0] == "blend" and (hnn is not None) and (lnn is not None):
                 w = float(picker[1])
                 with torch.set_grad_enabled(True):
-                    α_h = _hnn_accel_from_td(hnn, q, v)
-                    α_l = lnn_accel(lnn, q, v, dt=dt)
-                    α   = w * α_h + (1.0 - w) * α_l
-
+                    α = w * _hnn_accel_from_td(hnn, q, v) + (1.0 - w) * lnn_accel(lnn, q, v, dt=dt)
             else:
-                # fallback: if requested fuse not possible, choose available net
                 if hnn is not None:
                     with torch.set_grad_enabled(True):
                         α = _hnn_accel_from_td(hnn, q, v)
@@ -460,12 +567,11 @@ def rollout(
                 else:
                     α = torch.zeros_like(v)
 
-            # ---------------- Euler update ---------------------------
             Θ.append(q + v * dt)
             Ω.append(v + α * dt)
             Α.append(α)
 
-        Α = [torch.zeros_like(Α[0])] + Α          # prepend α₀ = 0
+        Α = [torch.zeros_like(Α[0])] + Α
         θ_buf.append(torch.stack(Θ, 1))
         ω_buf.append(torch.stack(Ω, 1))
         α_buf.append(torch.stack(Α, 1))
