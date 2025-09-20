@@ -470,3 +470,38 @@ class HNN(nn.Module):
         # `create_graph=True` keeps higher-order grads for HNN loss
         dF2 = torch.autograd.grad(F2.sum(), qp, create_graph=True)[0]
         return dF2 @ self.J.T                              # matrix product
+
+class ThetaHead1F(nn.Module):
+    """θ̂_t from one latent z_t: (B,D) -> (B,1)"""
+    def __init__(self, embed_dim: int, hidden: int | None = None):
+        super().__init__()
+        if hidden is None:
+            self.net = nn.Linear(embed_dim, 1)
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(embed_dim, hidden), nn.GELU(),
+                nn.Linear(hidden, 1),
+            )
+    def forward(self, z_t: torch.Tensor) -> torch.Tensor:
+        return self.net(z_t)  # (B,1)
+
+
+class OmegaHead2F(nn.Module):
+    """ω̂_t from TWO latents (z_t, z_{t+1}): concat and predict  (B,2D)->(B,1)"""
+    def __init__(self, embed_dim: int, hidden: int | None = None, use_diff: bool = False):
+        super().__init__()
+        self.use_diff = use_diff
+        in_dim = 2 * embed_dim  # concat(z_t, z_t1) OR concat((z1-z0)/dt, z0)
+        if hidden is None:
+            self.net = nn.Linear(in_dim, 1)
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, hidden), nn.GELU(),
+                nn.Linear(hidden, 1),
+            )
+    def forward(self, z_t: torch.Tensor, z_t1: torch.Tensor, dt: float) -> torch.Tensor:
+        if self.use_diff:
+            x = torch.cat([(z_t1 - z_t) / dt, z_t], dim=1)  # (B,2D)
+        else:
+            x = torch.cat([z_t, z_t1], dim=1)               # (B,2D)
+        return self.net(x)  # (B,1)

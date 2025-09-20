@@ -33,17 +33,27 @@ Public API
 - load_net(mode, *, suffix="_dense", model_dir=".", map_location="cpu")
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# loading_functions.py (patched)
+# ─────────────────────────────────────────────────────────────────────────────
 import os
 from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-# Type-only imports to avoid heavy module loading
 from utils.models import VJEPA, HNN, LNN  # your model classes
 
-# Default device selection; override via `map_location` if desired
 DEFAULT_DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Small helper: if all keys start with a prefix (e.g. "net."), strip it.
+def _strip_prefix_keys(sd: Optional[Dict[str, torch.Tensor]], prefix: str) -> Optional[Dict[str, torch.Tensor]]:
+    if sd is None or len(sd) == 0:
+        return sd
+    keys = list(sd.keys())
+    if all(k.startswith(prefix) for k in keys):
+        return {k[len(prefix):]: v for k, v in sd.items()}
+    return sd
 
 
 def split_ckpt(
@@ -52,77 +62,58 @@ def split_ckpt(
     *,
     map_location: Union[str, torch.device] = "cpu"
 ) -> Tuple[
-    Dict[str, torch.Tensor],         # vjepa_sd
+    Dict[str, torch.Tensor],            # vjepa_sd
     Optional[Dict[str, torch.Tensor]],  # theta_sd
+    Optional[Dict[str, torch.Tensor]],  # omega_sd
     Optional[Dict[str, torch.Tensor]],  # hnn_sd
     Optional[Dict[str, torch.Tensor]]   # lnn_sd
 ]:
     """
-    Load a checkpoint file and split its contents into four un-prefixed
-    state dictionaries: vjepa, theta_head, HNN, and LNN.
+    Load a checkpoint file and split into un-prefixed state dicts:
+    vjepa, theta_head, omega_head, HNN, LNN.
 
     Supports two layouts:
-      A) Prefixed combo: keys start with "vjepa.", "theta_head.", "hnn.", "lnn."
-      B) Flat VJEPA-only: requires `theta_path` for the head weights.
+      A) Prefixed combo in a single file `model_<mode>.pt` with keys:
+         "vjepa.*", "theta_head.*", "omega_head.*", "hnn.*", "lnn.*".
+      B) Flat VJEPA-only file + separate theta file:
+         `model_<mode>.pt` + `theta_<mode>.pt` (legacy; no omega file).
 
-    Parameters
-    ----------
-    model_path : str
-        Path to the VJEPA checkpoint (combo or flat).
-    theta_path : str, optional
-        Path to the θ→ω head checkpoint (required for flat layout).
-    map_location : str or torch.device
-        Device spec passed to `torch.load`.
-
-    Returns
-    -------
-    vjepa_sd  : Dict[str, torch.Tensor]
-        State-dict for the VJEPA backbone.
-    theta_sd  : Dict[str, torch.Tensor] or None
-        State-dict for the linear head, or None if included in combo.
-    hnn_sd    : Dict[str, torch.Tensor] or None
-        State-dict for the HNN, or None if not present.
-    lnn_sd    : Dict[str, torch.Tensor] or None
-        State-dict for the LNN, or None if not present.
-
-    Raises
-    ------
-    FileNotFoundError
-        If `model_path` (or required `theta_path`) does not exist.
-    ValueError
-        If flat layout detected (no "vjepa." prefixes) but `theta_path` is None.
+    Returns a 5-tuple: (vjepa_sd, theta_sd, omega_sd, hnn_sd, lnn_sd).
     """
-    # Load the checkpoint into CPU or specified device
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found: '{model_path}'")
+
     ckpt: Dict[str, torch.Tensor] = torch.load(model_path, map_location=map_location)
 
-    # Detect combo layout by presence of any "vjepa." key
-    if any(key.startswith("vjepa.") for key in ckpt):
-        # Helper to extract sub-dicts by prefix
+    # Combo layout: detect presence of "vjepa." keys
+    if any(k.startswith("vjepa.") for k in ckpt):
         def _strip(prefix: str) -> Dict[str, torch.Tensor]:
-            return {
-                key[len(prefix):]: val
-                for key, val in ckpt.items()
-                if key.startswith(prefix)
-            }
+            return {k[len(prefix):]: v for k, v in ckpt.items() if k.startswith(prefix)}
 
-        vjepa_sd = _strip("vjepa.")
-        theta_sd = _strip("theta_head.") or None
-        hnn_sd   = _strip("hnn.")        or None
-        lnn_sd   = _strip("lnn.")        or None
-        return vjepa_sd, theta_sd, hnn_sd, lnn_sd
+        vjepa_sd  = _strip("vjepa.")
+        theta_sd  = _strip("theta_head.") or None
+        omega_sd  = _strip("omega_head.") or None
+        hnn_sd    = _strip("hnn.")        or None
+        lnn_sd    = _strip("lnn.")        or None
 
-    # Otherwise assume flat layout: VJEPA only, head separate
+        # Handle nested "net.*" saved modules (common with small wrappers)
+        theta_sd  = _strip_prefix_keys(theta_sd, "net.")
+        omega_sd  = _strip_prefix_keys(omega_sd, "net.")
+        return vjepa_sd, theta_sd, omega_sd, hnn_sd, lnn_sd
+
+    # Flat layout (legacy): model file is VJEPA; head file is theta only
     if theta_path is None:
         raise ValueError(
-            f"Flat checkpoint detected at '{model_path}' "
-            "but no `theta_path` provided."
+            f"Flat checkpoint detected at '{model_path}' but no `theta_path` provided."
         )
     if not os.path.exists(theta_path):
         raise FileNotFoundError(f"Head checkpoint not found: '{theta_path}'")
 
     vjepa_sd = ckpt
     theta_sd: Dict[str, torch.Tensor] = torch.load(theta_path, map_location=map_location)
-    return vjepa_sd, theta_sd, None, None
+    theta_sd = _strip_prefix_keys(theta_sd, "net.")
+    omega_sd = None  # legacy layout has no separate omega file
+    return vjepa_sd, theta_sd, omega_sd, None, None
 
 
 def load_components(
@@ -135,40 +126,37 @@ def load_components(
     Dict[str, torch.Tensor],
     Optional[Dict[str, torch.Tensor]],
     Optional[Dict[str, torch.Tensor]],
+    Optional[Dict[str, torch.Tensor]],
     Optional[Dict[str, torch.Tensor]]
 ]:
     """
-    Convenience wrapper: locate the checkpoint files for a given `mode`
-    under `base_dir` and split them.
-
-    Expects:
-      - `model_<mode><suffix>.pt` (mandatory)
-      - `theta_<mode><suffix>.pt` (if flat layout)
-
-    Parameters
-    ----------
-    mode : str
-        Experiment mode, e.g. "plain", "hnn", "lnn", "hnn+lnn".
-    suffix : str
-        Filename suffix, e.g. "_dense" or "".
-    base_dir : str
-        Directory containing the checkpoint files.
-    map_location : str or torch.device
-        Passed to `split_ckpt`.
-
-    Returns
-    -------
-    Same as `split_ckpt`.
+    Locate `model_<mode><suffix>.pt` (and optionally `theta_<mode><suffix>.pt`)
+    and split into five un-prefixed state dicts:
+      vjepa_sd, theta_sd, omega_sd, hnn_sd, lnn_sd
     """
-    # Build expected paths
     model_file = os.path.join(base_dir, f"model_{mode}{suffix}.pt")
-    head_file  = os.path.join(base_dir, f"theta_{mode}{suffix}.pt")
+    head_file  = os.path.join(base_dir, f"theta_{mode}{suffix}.pt")  # legacy single-head fallback
 
     if not os.path.exists(model_file):
         raise FileNotFoundError(f"Model checkpoint not found: '{model_file}'")
 
-    # Delegate to split_ckpt
     return split_ckpt(model_file, head_file, map_location=map_location)
+
+
+# Simple head shells to match the two-head setup (keeps eval/train code tidy)
+class ThetaHead1F(nn.Module):
+    def __init__(self, D: int):
+        super().__init__()
+        self.net = nn.Linear(D, 1)
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+class OmegaHead2F(nn.Module):
+    def __init__(self, D: int):
+        super().__init__()
+        self.net = nn.Linear(2*D, 1)
+    def forward(self, z_t: torch.Tensor, z_tp1: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([z_t, z_tp1], dim=1))
 
 
 def load_net(
@@ -176,55 +164,48 @@ def load_net(
     *,
     suffix: str = "_dense",
     model_dir: str = ".",
-    map_location: Union[str, torch.device] = DEFAULT_DEVICE
-) -> Tuple[VJEPA, nn.Linear, Optional[HNN], Optional[LNN]]:
+    map_location: Union[str, torch.device] = DEFAULT_DEVICE,
+    embed_dim: int = 384,
+    h_hidden: int = 256,
+    l_hidden: int = 256,
+) -> Tuple[VJEPA, ThetaHead1F, OmegaHead2F, Optional[HNN], Optional[LNN]]:
     """
-    Instantiate and load the full set of networks for a given experiment mode.
-
-    Parameters
-    ----------
-    mode : str
-        One of "plain", "hnn", "lnn", "hnn+lnn".
-    suffix : str
-        Checkpoint filename suffix.
-    model_dir : str
-        Directory containing the checkpoint files.
-    map_location : str or torch.device
-        Device spec for model loading and instantiation.
+    Instantiate VJEPA + (theta_head, omega_head) + optional HNN/LNN and load weights.
 
     Returns
     -------
-    vjepa : VJEPA
-        The V-JEPA backbone with loaded weights.
-    head : nn.Linear
-        Linear layer mapping latent → (θ̂, ω̂).
-    hnn : HNN or None
-        Hamiltonian NN if present in checkpoint.
-    lnn : LNN or None
-        Lagrangian NN if present in checkpoint.
+    vjepa, theta_head, omega_head, hnn, lnn
     """
-    # 1) Retrieve raw state dicts
-    vjepa_sd, theta_sd, hnn_sd, lnn_sd = load_components(
+    vjepa_sd, theta_sd, omega_sd, hnn_sd, lnn_sd = load_components(
         mode, suffix=suffix, base_dir=model_dir, map_location=map_location
     )
 
-    # 2) Instantiate and load VJEPA backbone
-    vjepa = VJEPA(embed_dim=384, depth=6, num_heads=6).to(map_location)
+    # VJEPA
+    vjepa = VJEPA(embed_dim=embed_dim, depth=6, num_heads=6).to(map_location)
     vjepa.load_state_dict(vjepa_sd, strict=True)
 
-    # 3) Instantiate and load linear θ→ω head
-    head = nn.Linear(384, 2).to(map_location)
-    head.load_state_dict(theta_sd, strict=True)  # type: ignore[arg-type]
+    # Heads
+    theta_head = ThetaHead1F(embed_dim).to(map_location)
+    if theta_sd is not None:
+        theta_head.load_state_dict(theta_sd, strict=True)
+    else:
+        print(f"[{mode}] warning: no theta_head weights found; using random init")
 
-    # 4) Instantiate optional physics nets
+    omega_head = OmegaHead2F(embed_dim).to(map_location)
+    if omega_sd is not None:
+        omega_head.load_state_dict(omega_sd, strict=True)
+    else:
+        print(f"[{mode}] warning: no omega_head weights found; using random init")
+
+    # Physics nets (optional)
     hnn = None
     if hnn_sd is not None:
-        hnn = HNN(hidden_dim=256).to(map_location)
+        hnn = HNN(hidden_dim=h_hidden).to(map_location)
         hnn.load_state_dict(hnn_sd, strict=True)
 
     lnn = None
     if lnn_sd is not None:
-        lnn = LNN(input_dim=2, hidden_dim=256).to(map_location)
+        lnn = LNN(input_dim=2, hidden_dim=l_hidden).to(map_location)
         lnn.load_state_dict(lnn_sd, strict=True)
 
-    return vjepa, head, hnn, lnn
+    return vjepa, theta_head, omega_head, hnn, lnn
