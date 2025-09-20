@@ -154,6 +154,9 @@ class EvalConfig:
     ndiv_reduce:  Literal["step","mean"] = "step"
     ndiv_step:    int = -1
 
+    theta_axis: Optional[np.ndarray] = None
+    omega_axis: Optional[np.ndarray] = None
+
     # ---------- Euler–Lagrange residual ----------
     el_t_max:  int | None = None
     el_stride: int = 1
@@ -342,31 +345,112 @@ def _initial_conditions(theta: torch.Tensor, omega: torch.Tensor) -> tuple[np.nd
     ω0 = omega[:, 0].detach().cpu().numpy()
     return θ0, ω0
 
-def _infer_grid_axes(theta0: np.ndarray, omega0: np.ndarray, tol: float = 1e-6) -> tuple[np.ndarray | None, np.ndarray | None]:
-    θu = np.unique(np.round(theta0 / tol) * tol)
-    ωu = np.unique(np.round(omega0 / tol) * tol)
-    if θu.size * ωu.size == theta0.size:
-        return θu, ωu
-    return None, None
-
 def _reorder_to_grid(theta: torch.Tensor, omega: torch.Tensor,
                      theta0: np.ndarray, omega0: np.ndarray,
-                     theta_axis: np.ndarray, omega_axis: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+                     theta_axis: np.ndarray, omega_axis: np.ndarray
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Reorder (θ, ω) so index = iθ * Om + jω (θ outer, ω inner).
+    Each IC is mapped to the NEAREST (i,j) on supplied axes.
+    """
     Th, Om = theta_axis.size, omega_axis.size
-    θ2i = {val: i for i, val in enumerate(theta_axis)}
-    ω2j = {val: j for j, val in enumerate(omega_axis)}
-    def q(x): return np.round(x / 1e-6) * 1e-6
-    order_idx = []
-    for th, om in zip(q(theta0), q(omega0)):
-        i = θ2i.get(th, None); j = ω2j.get(om, None)
-        if i is None or j is None:
-            order = np.lexsort((omega0, theta0))  # θ outer, ω inner
-            return theta[order], omega[order]
-        order_idx.append(i * Om + j)
-    inv_perm = np.argsort(order_idx).astype(np.int64)
+
+    # nearest index along each axis
+    ii = np.abs(theta_axis[None, :] - theta0[:, None]).argmin(axis=1)  # (N,)
+    jj = np.abs(omega_axis[None, :] - omega0[:, None]).argmin(axis=1)  # (N,)
+
+    order = ii * Om + jj                                               # (N,)
+    inv_perm = np.argsort(order).astype(np.int64)
     inv_perm_t = torch.from_numpy(inv_perm).to(theta.device)
+
     return theta.index_select(0, inv_perm_t), omega.index_select(0, inv_perm_t)
 
+import numpy as np
+import torch
+from typing import Tuple, Optional
+
+def collapse_to_grid_ics(
+    theta: torch.Tensor,   # (N, T) rollout θ (CPU or CUDA)
+    omega: torch.Tensor,   # (N, T) rollout ω
+    *,
+    theta0: np.ndarray,    # (N,) TRUE initial θ for each window (from dataset labels at t=0)
+    omega0: np.ndarray,    # (N,) TRUE initial ω for each window (from dataset labels at t=0)
+    theta_axis: np.ndarray,  # (Th,)
+    omega_axis: np.ndarray,  # (Om,)
+    require_full_cover: bool = True,   # error if any grid cell has no representative
+    tol: Optional[float] = None        # optional max distance to accept a representative
+) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
+    """
+    Collapse many windows per IC into exactly one trajectory per (θ_axis[i], ω_axis[j]) cell.
+
+    Returns
+    -------
+    theta_c : (Th*Om, T)
+    omega_c : (Th*Om, T)
+    chosen  : (Th*Om,) int array of source indices used for each grid cell (row-major θ-outer, ω-inner)
+
+    Notes
+    -----
+    • Uses *true* θ0/ω0 to pick the representative (closest window to the grid point).
+    • Reorders outputs to row-major (iθ outer, jω inner).
+    • If `require_full_cover=False`, cells with no candidate are skipped; outputs shrink accordingly.
+    """
+    assert theta.ndim == 2 and omega.ndim == 2, "θ/ω must be (N,T)"
+    N, T = theta.shape
+    assert omega.shape == (N, T)
+    assert theta0.shape == (N,) and omega0.shape == (N,), "theta0/omega0 must be (N,) arrays"
+
+    # Work on CPU for indexing
+    dev = theta.device
+    θ = theta.detach().cpu()
+    ω = omega.detach().cpu()
+
+    Th, Om = int(theta_axis.size), int(omega_axis.size)
+
+    # Build (Th*Om, 2) grid of target ICs
+    grid_θ, grid_ω = np.meshgrid(theta_axis, omega_axis, indexing="ij")  # θ-outer, ω-inner
+    targets = np.stack([grid_θ.reshape(-1), grid_ω.reshape(-1)], axis=1) # (Th*Om, 2)
+
+    # All window ICs (N, 2)
+    src = np.stack([theta0, omega0], axis=1)
+
+    chosen = np.full((Th * Om,), fill_value=-1, dtype=np.int64)
+    dmin   = np.full((Th * Om,), fill_value=np.inf, dtype=np.float64)
+
+    # For each grid cell, find the closest window (in IC space)
+    # Vectorised: compute distances from all windows to each target in chunks (memory-safe)
+    # But for typical sizes, a simple loop is fine and clearer:
+    for idx, (th_t, om_t) in enumerate(targets):
+        d = (src[:, 0] - th_t)**2 + (src[:, 1] - om_t)**2  # squared distance
+        j = int(np.argmin(d))
+        dm = float(d[j])
+        if tol is not None and dm > tol**2:
+            # No acceptable representative for this cell
+            continue
+        chosen[idx] = j
+        dmin[idx]   = dm
+
+    if require_full_cover and np.any(chosen < 0):
+        missing = np.nonzero(chosen < 0)[0]
+        # give a small, actionable message
+        raise ValueError(
+            f"collapse_to_grid_ics: {missing.size} grid cells have no representative "
+            f"(consider lowering `tol` or regenerating windows to cover the grid)."
+        )
+
+    # If skipping missing cells, filter them out
+    valid_mask = (chosen >= 0)
+    chosen_valid = chosen[valid_mask]
+    if chosen_valid.size == 0:
+        raise ValueError("collapse_to_grid_ics: no grid cell received a representative window.")
+
+    # Gather and keep row-major θ-outer, ω-inner order
+    idx_t = torch.from_numpy(chosen_valid).to(torch.long)
+    θ_c = θ.index_select(0, idx_t).to(dev)
+    ω_c = ω.index_select(0, idx_t).to(dev)
+
+    return θ_c, ω_c, chosen
+    
 # ====================================================================
 # Evaluate ONE mode — wired to dispatchers + helper rollout
 # ====================================================================
@@ -410,14 +494,38 @@ def evaluate_mode(
     )
     θc, ωc = θ.detach().cpu(), ω.detach().cpu()  # metrics run on CPU
 
-    # 5) ICs / grid axes for dispatchers
+    # 5) ICs / grid axes for dispatchers  --------------------------------
     θ0_np, ω0_np = _initial_conditions(θc, ωc)
-    θ_axis = ω_axis = None
-    if cfg.ndiv_mode in ("grid", "window"):
-        θ_axis, ω_axis = _infer_grid_axes(θ0_np, ω0_np)
-    if cfg.ndiv_mode == "grid" and θ_axis is not None and ω_axis is not None:
+
+    # Pull user axes if present; otherwise keep None and infer later
+    θ_axis = getattr(cfg, "theta_axis", None)
+    ω_axis = getattr(cfg, "omega_axis", None)
+
+    # Normalize provided axes (avoid ambiguous array truth)
+    if θ_axis is not None:
+        θ_axis = np.asarray(θ_axis).reshape(-1)
+    if ω_axis is not None:
+        ω_axis = np.asarray(ω_axis).reshape(-1)
+
+    # If we are in grid/window mode and axes were not provided, try to infer
+    if cfg.ndiv_mode in ("grid", "window") and (θ_axis is None or ω_axis is None):
+        θ_axis_inf, ω_axis_inf = _infer_grid_axes(θ0_np, ω0_np)
+        θ_axis = θ_axis if θ_axis is not None else θ_axis_inf
+        ω_axis = ω_axis if ω_axis is not None else ω_axis_inf
+
+    # If we have grid axes, reorder trajectories to match θ-outer/ω-inner indexing
+    if cfg.ndiv_mode == "grid" and (θ_axis is not None) and (ω_axis is not None):
+        # Optional: reorder to grid layout expected by *_grid metrics
         θc, ωc = _reorder_to_grid(θc, ωc, θ0_np, ω0_np, θ_axis, ω_axis)
-        θ0_np, ω0_np = _initial_conditions(θc, ωc)  # keep ICs in sync
+        θ0_np, ω0_np = _initial_conditions(θc, ωc)
+
+        # Early sanity check so later metrics don’t crash mysteriously
+        N = θc.shape[0]
+        Th, Om = len(θ_axis), len(ω_axis)
+        if N != Th * Om:
+            raise ValueError(
+                f"Grid size mismatch: N={N} but len(theta_axis)*len(omega_axis)={Th}*{Om}={Th*Om}"
+            )
 
     # 6) scalar metrics
     Δ_div = neighbour_divergence_scalar_dispatch(
@@ -726,70 +834,70 @@ def evaluate_mode(
 #     print(f"\n✓ combined metrics saved → {out_file}")
 #     return all_metrics
 
-# # ====================================================================
-# # 6 · Legacy plotting helpers
-# # ====================================================================
-# _REMAP = {"total":"loss_total","jepa":"loss_jepa",
-#           "hnn":"loss_hnn","lnn":"loss_lnn","sup":"loss_sup"}
+# ====================================================================
+# 6 · Legacy plotting helpers
+# ====================================================================
+_REMAP = {"total":"loss_total","jepa":"loss_jepa",
+          "hnn":"loss_hnn","lnn":"loss_lnn","sup":"loss_sup"}
 
-# metrics_to_plot: list[tuple[str, str]] = [
-#     ("loss_total", "total objective"),
-#     ("loss_hnn",   "HNN residual"),
-#     ("loss_lnn",   "LNN residual"),
-#     ("loss_jepa",  "JEPA reconstruction"),
-#     ("loss_sup",   "θ supervision"),
-# ]
+metrics_to_plot: list[tuple[str, str]] = [
+    ("loss_total", "total objective"),
+    ("loss_hnn",   "HNN residual"),
+    ("loss_lnn",   "LNN residual"),
+    ("loss_jepa",  "JEPA reconstruction"),
+    ("loss_sup",   "θ supervision"),
+]
 
-# def normalise_keys(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-#     """Map legacy keys (total/jepa/…) → new loss_* names."""
-#     return { _REMAP.get(k, k): v for k,v in arrays.items() }
+def normalise_keys(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Map legacy keys (total/jepa/…) → new loss_* names."""
+    return { _REMAP.get(k, k): v for k,v in arrays.items() }
 
-# def plot_loss(
-#     component: str,
-#     logs: Dict[str, Dict[str, np.ndarray]],
-#     *,
-#     ylabel: str | None = None
-# ) -> None:
-#     """
-#     Overlay loss curves from multiple runs.
+def plot_loss(
+    component: str,
+    logs: Dict[str, Dict[str, np.ndarray]],
+    *,
+    ylabel: str | None = None
+) -> None:
+    """
+    Overlay loss curves from multiple runs.
 
-#     Parameters
-#     ----------
-#     component : e.g. 'loss_total', 'loss_hnn', …
-#     logs      : mode → arrays (already `normalise_keys`-processed)
-#     """
-#     plt.figure(figsize=(7,4))
-#     for mode, rec in logs.items():
-#         if component in rec:
-#             plt.plot(rec[component], label=mode)
-#     plt.xlabel("epoch")
-#     plt.ylabel(ylabel or component)
-#     plt.title(component)
-#     plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+    Parameters
+    ----------
+    component : e.g. 'loss_total', 'loss_hnn', …
+    logs      : mode → arrays (already `normalise_keys`-processed)
+    """
+    plt.figure(figsize=(7,4))
+    for mode, rec in logs.items():
+        if component in rec:
+            plt.plot(rec[component], label=mode)
+    plt.xlabel("epoch")
+    plt.ylabel(ylabel or component)
+    plt.title(component)
+    plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
     
-# def plot_selected_losses(
-#     logs: Dict[str, Dict[str, np.ndarray]],
-#     *,
-#     items: list[tuple[str, str]] = metrics_to_plot
-# ) -> None:
-#     """
-#     Iterate over `items` and draw a loss curve **only if** at least one
-#     run in `logs` contains the given key.
+def plot_selected_losses(
+    logs: Dict[str, Dict[str, np.ndarray]],
+    *,
+    items: list[tuple[str, str]] = metrics_to_plot
+) -> None:
+    """
+    Iterate over `items` and draw a loss curve **only if** at least one
+    run in `logs` contains the given key.
 
-#     Parameters
-#     ----------
-#     logs
-#         Dict mapping *mode* → dict of numpy arrays
-#         (already passed through `normalise_keys` if needed).
-#     items
-#         Sequence of ``(loss_key, y-label)`` tuples.  Defaults to the
-#         canonical list above.
-#     """
-#     for key, label in items:
-#         if any(key in rec for rec in logs.values()):  # at least one run has it?
-#             plot_loss(key, logs, ylabel=label)        # use the existing helper
-#         else:
-#             print(f"[skip] no log contains '{key}'")
+    Parameters
+    ----------
+    logs
+        Dict mapping *mode* → dict of numpy arrays
+        (already passed through `normalise_keys` if needed).
+    items
+        Sequence of ``(loss_key, y-label)`` tuples.  Defaults to the
+        canonical list above.
+    """
+    for key, label in items:
+        if any(key in rec for rec in logs.values()):  # at least one run has it?
+            plot_loss(key, logs, ylabel=label)        # use the existing helper
+        else:
+            print(f"[skip] no log contains '{key}'")
 
 # ====================================================================
 # Evaluate MANY modes — auto-detect fusion, pass cfg/switches

@@ -119,6 +119,49 @@ def neighbour_divergence_scalar_pairwise(
         torch.stack([dθ, dω], dim=0), dim=0)         # (P,T)
     return _reduce_over_time(dist_pairs_T, reduce=reduce, step=step)
 
+def neighbour_divergence_curve_pairwise_sparse(
+    θ: torch.Tensor, ω: torch.Tensor,
+    *, ε: float = 0.1, return_curve: bool = False, block: int = 2048
+) -> tuple[np.ndarray | None, float]:
+    """
+    Memory-safe pairwise Δ(t) curve.
+    - Finds neighbour pairs using ε at t=0 in blocks (O(N²) compute, but O(N·block) memory).
+    - Accumulates distances only for the selected pairs (no (N,N,T) tensor).
+    """
+    assert θ.ndim == 2 and ω.ndim == 2
+    N, T = θ.shape
+    device = θ.device
+
+    start = torch.stack([θ[:, 0], ω[:, 0]], dim=1)  # (N,2)
+
+    curve_sum = torch.zeros(T, device=device, dtype=θ.dtype)
+    n_pairs   = 0
+
+    for i0 in range(0, N, block):
+        i1 = min(N, i0 + block)
+        S  = start[i0:i1]                           # (B,2)
+        # distances at t=0, block × N
+        d0 = torch.cdist(S, start, p=2)             # (B,N)
+        mask = (d0 > 0) & (d0 < ε)
+
+        if mask.any():
+            Ii, Jj = torch.nonzero(mask, as_tuple=True)  # Ii∈[0,B), Jj∈[0,N)
+            Iglob  = Ii + i0
+            # pairwise Δ over all time
+            dθ = θ[Iglob] - θ[Jj]                    # (P,T)
+            dω = ω[Iglob] - ω[Jj]                    # (P,T)
+            dist = torch.linalg.vector_norm(torch.stack([dθ, dω], dim=0), dim=0)  # (P,T)
+            curve_sum += dist.sum(dim=0)
+            n_pairs   += dist.size(0)
+
+    if n_pairs == 0:
+        curve = torch.zeros(T, dtype=torch.float32).cpu().numpy()
+        return (curve if return_curve else None), 0.0
+
+    curve = (curve_sum / n_pairs).detach().cpu().numpy().astype(np.float32)
+    slope = float(np.polyfit(np.arange(T, dtype=np.float32), curve, 1)[0])
+    return (curve if return_curve else None), slope
+
 def neighbour_divergence_scalar_grid(
     θ: torch.Tensor, ω: torch.Tensor, *,
     theta_axis: np.ndarray, omega_axis: np.ndarray,
@@ -137,7 +180,9 @@ def neighbour_divergence_scalar_grid(
             for di, dj in offs:
                 ii, jj = i+di, j+dj
                 if 0 <= ii < Th and 0 <= jj < Om:
-                    pairs.append((src, ii*Om + jj))
+                    nbr = ii*Om + jj
+                    if src < nbr:                   # de-duplicate
+                        pairs.append((src, nbr))
     if not pairs:
         return 0.0
     I = torch.tensor([p[0] for p in pairs], dtype=torch.long)
@@ -201,8 +246,14 @@ def neighbour_divergence_scalar_dispatch(
     omega0: np.ndarray | None = None,
 ) -> float:
     if cfg.ndiv_mode == "pairwise":
-        return neighbour_divergence_scalar_pairwise(
-            θ, ω, eps=cfg.ndiv_eps, reduce=cfg.ndiv_reduce, step=cfg.ndiv_step
+        # return neighbour_divergence_scalar_pairwise(
+        #     θ, ω, eps=cfg.ndiv_eps, reduce=cfg.ndiv_reduce, step=cfg.ndiv_step
+        # )
+        eps = getattr(cfg, "ndiv_eps", 0.1)
+        # optional: allow cfg.ndiv_block to tune memory/throughput
+        block = getattr(cfg, "ndiv_block", 2048)
+        return neighbour_divergence_curve_pairwise_sparse(
+            θ, ω, ε=eps, return_curve=return_curve, block=block
         )
     elif cfg.ndiv_mode == "grid":
         if theta_axis is None or omega_axis is None:
@@ -512,47 +563,66 @@ import numpy as np, torch
 
 def neighbour_divergence_curve_grid(
     θ: torch.Tensor, ω: torch.Tensor,                  # (N,T) CPU tensors
-    *, theta_axis: np.ndarray, omega_axis: np.ndarray, # 1D arrays used to build the grid
-    stencil: str = "4",                                # "4" or "8"
-    return_curve: bool = False
+    *, theta_axis: np.ndarray, omega_axis: np.ndarray, # 1D grid axes
+    stencil: str = "4",
+    return_curve: bool = False,
+    pair_chunk: int = 65536                            # NEW: chunk over pairs
 ):
     """
-    Neighbour divergence only to grid-adjacent ICs.
-    Assumes dataset order is theta-outer, omega-inner (no shuffle) so that
-    index = iθ * Om + jω.
+    Grid-adjacent neighbour-divergence computed in streaming chunks over pairs
+    to avoid allocating a full (P,T) tensor. Memory ~ O(chunk*T), not O(P*T).
     """
     N, T = θ.shape
     Th, Om = len(theta_axis), len(omega_axis)
     assert N == Th * Om, "θ/ω count does not match theta×omega grid size"
 
-    # build (iθ, jω) for each trajectory
-    ij = np.array([(i, j) for i in range(Th) for j in range(Om)], dtype=int)
-
-    # neighbour offsets
+    # build neighbour pairs (src -> nbr) once as Python list
     offs4 = [(+1,0), (-1,0), (0,+1), (0,-1)]
     offs8 = offs4 + [(+1,+1), (+1,-1), (-1,+1), (-1,-1)]
     offs  = offs8 if stencil == "8" else offs4
 
-    # collect all valid neighbour pairs (i -> j) once
     pairs = []
-    for idx, (i, j) in enumerate(ij):
-        for di, dj in offs:
-            ii, jj = i+di, j+dj
-            if 0 <= ii < Th and 0 <= jj < Om:
-                nbr = ii*Om + jj
-                pairs.append((idx, nbr))
-    if len(pairs) == 0:
+    for i in range(Th):
+        for j in range(Om):
+            src = i*Om + j
+            for di, dj in offs:
+                ii, jj = i+di, j+dj
+                if 0 <= ii < Th and 0 <= jj < Om:
+                    nbr = ii*Om + jj
+                    if src < nbr:                   # de-duplicate
+                        pairs.append((src, nbr))
+    if not pairs:
         curve = np.zeros(T, dtype=np.float32)
         return (curve if return_curve else None), 0.0
 
-    # stack distances over time
-    idx_i = torch.tensor([p[0] for p in pairs], dtype=torch.long)
-    idx_j = torch.tensor([p[1] for p in pairs], dtype=torch.long)
-    dθ = θ[idx_i] - θ[idx_j]           # (P, T)
-    dω = ω[idx_i] - ω[idx_j]           # (P, T)
-    dist = torch.linalg.vector_norm(torch.stack([dθ, dω], dim=0), dim=0)   # (P, T)
+    # convert to tensors on CPU
+    I = torch.tensor([p[0] for p in pairs], dtype=torch.long)
+    J = torch.tensor([p[1] for p in pairs], dtype=torch.long)
 
-    curve = dist.mean(dim=0).numpy()   # (T,)
+    # streaming accumulation
+    sum_curve = torch.zeros(T, dtype=torch.float32)
+    count = 0
+
+    # process in chunks along the pair dimension
+    for start in range(0, I.numel(), pair_chunk):
+        end = min(start + pair_chunk, I.numel())
+        idx_i = I[start:end]
+        idx_j = J[start:end]
+
+        dθ = θ.index_select(0, idx_i) - θ.index_select(0, idx_j)   # (p,T)
+        dω = ω.index_select(0, idx_i) - ω.index_select(0, idx_j)   # (p,T)
+
+        # (p,T) distances; garbage-collected each chunk
+        dist = torch.linalg.vector_norm(
+            torch.stack([dθ, dω], dim=0), dim=0)                   # (p,T)
+
+        sum_curve += dist.sum(dim=0)
+        count += dist.size(0)
+
+        # free chunk temporaries early (helps on GPU/CPU)
+        del dθ, dω, dist
+
+    curve = (sum_curve / max(count, 1)).numpy()
     slope = _linear_slope(curve)
     return (curve if return_curve else None), slope
 
