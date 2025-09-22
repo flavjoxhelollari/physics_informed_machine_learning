@@ -35,7 +35,7 @@ from sklearn.linear_model import LinearRegression          # linear-fit
 # --------------------------------------------------------------------
 # Project-local imports (paths must be on PYTHONPATH when importing)
 # --------------------------------------------------------------------
-from utils.models              import VJEPA, HNN, LNN                # NN classes
+from utils.models              import *                # NN classes
 from utils.loading_functions   import load_components                # ckpt splitter
 from utils.evaluation_metrics  import *
 from utils.helper_functions    import *                        # latent rollout
@@ -84,54 +84,66 @@ class EvalConfig:
     ndiv_reduce: Literal["step","mean"] = "step"
     ndiv_step: int = -1  # used only when ndiv_reduce == "step"
 
+    # NEW: target normalization stats (same used in training)
+    theta_mu         : float = 0.0
+    theta_std        : float = 1.0
+    omega_mu         : float = 0.0
+    omega_std        : float = 1.0
+
 
 # ====================================================================
 # 2 · Head scatter collector
 # ====================================================================
 def collect_head_scatter(
     model: VJEPA,
-    head:  torch.nn.Module,
+    theta_head: torch.nn.Module,
+    omega_head: torch.nn.Module,
     dataset,
     *,
     n_samples: int,
-    batch:     int
+    batch:     int,
+    dt: float,
+    theta_mu: float, theta_std: float,
+    omega_mu: float, omega_std: float,
 ) -> tuple[np.ndarray, ...]:
     """
-    Sample up to *n_samples* frames (t=0) and return:
-
-    Returns
-    -------
-    θ_true, ω_true, θ_pred, ω_pred : np.ndarray
-        All shape (n_samples,)
+    Collect (θ_true, ω_true) and predictions at the earliest available times:
+      θ at t=0 (single-frame), ω at t=1 using (z1, z0).
+    Returns arrays of shape (n_samples,).
     """
-    # put sub-nets in eval mode
-    model.eval(); head.eval()
+    model.eval(); theta_head.eval()
+    if hasattr(omega_head, "eval"): omega_head.eval()
 
-    # random batching
     loader = DataLoader(dataset, batch_size=batch, shuffle=True)
-
-    # pre-allocate Python lists, convert later
     θ_true, ω_true, θ_pred, ω_pred = [], [], [], []
-    collected = 0                                                     # counter
+    collected = 0
 
-    for seq, states in loader:                                        # loop batches
-        imgs = seq[:, 0].to(device)                                   # (B,C,H,W) first frame
-        with torch.no_grad():                                         # no grad needed
-            z_lat = model.patch_embed(imgs) + model.pos_embed         # patch + pos
-            z_lat = model.context_encoder(z_lat).mean(1)              # (B,D) pooled
-            θ_hat, ω_hat = head(z_lat).split(1, 1)                    # (B,1) each
+    for seq, states in loader:
+        seq = seq.to(device)                         # (B,T,C,H,W)
+        B, T, C, H, W = seq.shape
+        imgs = seq.reshape(B*T, C, H, W)
+        with torch.no_grad():
+            z_flat = model.context_encoder(model.patch_embed(imgs) + model.pos_embed).mean(1)
+            z = z_flat.reshape(B, T, -1)            # (B,T,D)
+            # θ at t=0
+            θ_pn = theta_head(z[:,0,:])             # (B,1) normalized
+            θ_hat = (θ_pn * theta_std + theta_mu).squeeze(-1)  # (B,)
+            # ω at t=1 using (z1, z0) if available
+            if T >= 2:
+                ω_pn = omega_head(z[:,1,:], z[:,0,:], dt)      # (B,1) normalized
+                ω_hat = (ω_pn * omega_std + omega_mu).squeeze(-1)
+            else:
+                ω_hat = torch.zeros(B, device=seq.device)
 
-        # store CPU numpy copies
-        θ_true.extend(states[:, 0, 0].cpu().numpy())                  # real θ
-        ω_true.extend(states[:, 0, 1].cpu().numpy())                  # real ω
-        θ_pred.extend(θ_hat.squeeze().cpu().numpy())                  # predicted θ
-        ω_pred.extend(ω_hat.squeeze().cpu().numpy())                  # predicted ω
+        θ_true.extend(states[:, 0, 0].cpu().numpy())
+        ω_true.extend(states[:, 1, 1].cpu().numpy() if T>=2 else np.zeros(B))
+        θ_pred.extend(θ_hat.detach().cpu().numpy())
+        ω_pred.extend(ω_hat.detach().cpu().numpy())
 
-        collected += imgs.size(0)                                     # update counter
-        if collected >= n_samples:                                    # stop if enough
-            break                                                     # … exit loop
+        collected += B
+        if collected >= n_samples:
+            break
 
-    # cast lists → numpy of exact length n_samples
     return (np.array(θ_true)[:n_samples],
             np.array(ω_true)[:n_samples],
             np.array(θ_pred)[:n_samples],
@@ -167,35 +179,120 @@ def evaluate_mode(
     save_curves       : bool = False,
 ) -> Dict[str, float]:
 
-    # 1) load components (unchanged)
+    # 1) -------- load state-dicts -----------------------------------
     v_sd, t_sd, hnn_sd, lnn_sd = load_components(
         mode, suffix=cfg.suffix, base_dir=cfg.model_dir)
 
+    # 2) -------- rebuild modules & weights --------------------------
     model = VJEPA(embed_dim=384, depth=6, num_heads=6).to(device)
-    head  = torch.nn.Linear(384, 2).to(device)
     model.load_state_dict(v_sd, strict=True)
-    head .load_state_dict(t_sd,  strict=True)
-
+    
+    theta_head = ThetaHead(384).to(device)
+    omega_head = OmegaHead(384).to(device)
+    
+    def _looks_like_linear2(sd: dict) -> bool:
+        return ("weight" in sd) and ("bias" in sd) and sd["weight"].dim() == 2 and sd["weight"].size(0) == 2
+    
+    def _strip_prefix(sd: dict, prefix: str) -> dict:
+        return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+    
+    loaded_variant = None
+    try:
+        # Case A: new two-head format with prefixes
+        theta_sd = _strip_prefix(t_sd, "theta_head.")
+        omega_sd = _strip_prefix(t_sd, "omega_head.")
+        if theta_sd and omega_sd:
+            theta_head.load_state_dict(theta_sd, strict=True)
+            omega_head.load_state_dict(omega_sd, strict=True)
+            loaded_variant = "two-head (namespaced)"
+        else:
+            raise KeyError("namespaced heads not both present")
+    except Exception:
+        # Case B: legacy single Linear(384->2)
+        if _looks_like_linear2(t_sd):
+            legacy = torch.nn.Linear(384, 2).to(device)
+            legacy.load_state_dict(t_sd, strict=True)
+    
+            class _LegacyWrap(torch.nn.Module):
+                def __init__(self, lin): super().__init__(); self.lin = lin
+                def theta(self, z):
+                    y = self.lin(z); return y[..., :1]
+                def omega(self, z):
+                    y = self.lin(z); return y[..., 1:]
+            L = _LegacyWrap(legacy)
+    
+            class ThetaFromLegacy(torch.nn.Module):
+                def __init__(self, L): super().__init__(); self.L = L
+                def forward(self, z):
+                    if z.dim()==3: B,T,D = z.shape; return self.L.theta(z.reshape(B*T,D)).reshape(B,T,1)
+                    return self.L.theta(z).unsqueeze(-1)
+            class OmegaFromLegacy(torch.nn.Module):
+                def __init__(self, L): super().__init__(); self.L = L
+                def forward(self, z_t, z_tm1, dt):
+                    # no two-frame info in legacy; use z_t only
+                    if z_t.dim()==3: B,Tp,D = z_t.shape; return self.L.omega(z_t.reshape(B*Tp,D)).reshape(B,Tp,1)
+                    return self.L.omega(z_t).unsqueeze(-1)
+    
+            theta_head = ThetaFromLegacy(L).to(device)
+            omega_head = OmegaFromLegacy(L).to(device)
+            loaded_variant = "legacy linear(2) split"
+        else:
+            # Case C: single MLP head state-dict (e.g., ThetaHead only)
+            has_mlp_keys = any(k.startswith("net.") for k in t_sd.keys())
+            if has_mlp_keys:
+                try:
+                    theta_head.load_state_dict(t_sd, strict=True)
+                    # omega_head stays randomly init (no weights present)
+                    loaded_variant = "single MLP head (theta only)"
+                except Exception as err:
+                    raise RuntimeError(f"Unrecognized head state-dict format (single MLP) – {err}") from err
+            else:
+                # Final fallback: maybe t_sd held a namespaced *module* dict under an unexpected root
+                # Try to find any subprefix automatically.
+                prefixes = set(k.split(".", 1)[0] for k in t_sd.keys() if "." in k)
+                matched = False
+                for pref in prefixes:
+                    sub = _strip_prefix(t_sd, pref + ".")
+                    try:
+                        theta_head.load_state_dict(sub, strict=True)
+                        loaded_variant = f"heuristic: loaded theta_head from '{pref}.'"
+                        matched = True
+                        break
+                    except Exception:
+                        continue
+                if not matched:
+                    raise RuntimeError(
+                        "Could not parse head checkpoint. Supported: "
+                        "[theta_head.*, omega_head.*] or Linear(384->2) or single MLP (net.*). "
+                        f"Keys seen: {list(t_sd.keys())[:6]} ..."
+                    )
+    
+    # physics heads (optional)
     hnn = lnn = None
     if hnn_sd:
         hnn = HNN(hidden_dim=256).to(device); hnn.load_state_dict(hnn_sd, strict=True)
     if lnn_sd:
         lnn = LNN(input_dim=2, hidden_dim=256).to(device); lnn.load_state_dict(lnn_sd, strict=True)
 
-    # 2) deterministic eval loader
+    # 3) -------- deterministic eval loader --------------------------
     eval_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
 
-    # 3) NEW: per-frame preds and rollout from t=0
+    # 4) -------- per-frame preds and rollout from t=0 ---------------
     θ_img, ω_img, θ_roll, ω_roll, α_roll = rollout_align_with_goal(
-        vjepa=model, head=head,
+        vjepa=model,
+        theta_head=theta_head,
+        omega_head=omega_head,
         eval_loader=eval_loader,
-        horizon=cfg.horizon, dt=cfg.dt,
+        horizon=cfg.horizon,
+        dt=cfg.dt,
         hnn=hnn, lnn=lnn, combine=combine,
-        integrator="verlet",        # better long-term stability
-        context_mode="t0",          # mirror training context cheaply
+        integrator="verlet",         # better long-term stability
+        context_mode="t0",
+        theta_mu=cfg.theta_mu, theta_std=cfg.theta_std,
+        omega_mu=cfg.omega_mu, omega_std=cfg.omega_std,
     )
 
-    # 4) Gather ground-truth aligned with loader order
+    # 5) -------- gather ground-truth aligned with loader order ------
     θ_true_list, ω_true_list = [], []
     for _, states in eval_loader:
         θ_true_list.append(states[:, :θ_img.shape[1], 0])
@@ -203,7 +300,7 @@ def evaluate_mode(
     θ_true = torch.cat(θ_true_list, 0).cpu()
     ω_true = torch.cat(ω_true_list, 0).cpu()
 
-    # 5) Physics metrics (use rollout)
+    # 6) -------- base physics metrics (use rollout) -----------------
     metrics: Dict[str, float] = {
         "Δ_div"  : neighbour_divergence(θ_roll, ω_roll),
         "E_drift": energy_drift(θ_roll, ω_roll, m=cfg.m, g=cfg.g, l=cfg.l),
@@ -225,29 +322,51 @@ def evaluate_mode(
         if lnn is not None:
             metrics["EL_curve"] = EL_curve.tolist()
 
-    # 6) NEW: per-frame image→latent metrics (central claim)
+    # 7) -------- per-frame image→latent metrics (central claim) ----
     metrics.update(perframe_img_metrics(θ_true, ω_true, θ_img, ω_img))
 
-    # 7) NEW: rollout-vs-truth MSE (for completeness)
+    # 8) -------- rollout-vs-truth MSE (for completeness) -----------
     metrics.update(rollout_mse(θ_true, ω_true, θ_roll, ω_roll))
 
-    # 8) NEW: one-step self-consistency (local physics vs encoder)
+    # 9) -------- one-step self-consistency --------------------------
     metrics.update(one_step_consistency(
         θ_img, ω_img, dt=cfg.dt, hnn=hnn, lnn=lnn, combine=(combine or "hnn"),
         integrator="verlet"
     ))
 
-    # 9) Optional: acceleration MSE vs analytic (uses rollout α)
+    # 10) ------- acceleration MSE vs analytic (uses rollout α) -----
     metrics["accel_mse_true"] = accel_mse(θ_true, α_roll, g=cfg.g, l=cfg.l)
 
-    # 10) Existing head-scatter diagnostic (frame-0 only) – keep as-is
-    θ_t, ω_t, θ_p, ω_p = collect_head_scatter(
-        model, head, dataset,
-        n_samples=cfg.scatter_samples,
-        batch    =cfg.scatter_batch)
+    # 11) ------- head-scatter diagnostic (frame-0 / two-head aware) -
+    try:
+        θ_t, ω_t, θ_p, ω_p = collect_head_scatter(
+            model, theta_head, omega_head, dataset,
+            n_samples=cfg.scatter_samples,
+            batch    =cfg.scatter_batch,
+            dt       =cfg.dt,
+            theta_mu =cfg.theta_mu, theta_std=cfg.theta_std,
+            omega_mu =cfg.omega_mu, omega_std=cfg.omega_std
+        )
+    except TypeError:
+        # Back-compat: fall back to legacy collector that expects a single head
+        single_head = torch.nn.Linear(384, 2).to(device)
+        # try to map from t_sd into a plain Linear (best-effort)
+        try:
+            single_sd = {k[len("theta_head."):]: v for k, v in t_sd.items()}
+            single_head.load_state_dict(single_sd, strict=False)
+        except Exception:
+            try:
+                single_head.load_state_dict(t_sd, strict=False)
+            except Exception:
+                pass
+        θ_t, ω_t, θ_p, ω_p = collect_head_scatter(
+            model, single_head, dataset,
+            n_samples=cfg.scatter_samples,
+            batch    =cfg.scatter_batch
+        )
     metrics.update(head_regression_metrics(θ_t, ω_t, θ_p, ω_p))
 
-    # 11) -------- optional scatter plot -----------------------------
+    # 12) ------- optional scatter plot ------------------------------
     if plot_head_scatter:
         plt.figure(figsize=(10, 5))
         # θ
@@ -265,8 +384,7 @@ def evaluate_mode(
         plt.suptitle(f"Head predictions vs truth – {mode}")
         plt.tight_layout(); plt.show()
 
-
-    # 12) Save JSON (unchanged)
+    # 13) ------- write JSON ----------------------------------------
     os.makedirs(cfg.out_dir, exist_ok=True)
     out_path = os.path.join(cfg.out_dir, f"metrics_{mode}{cfg.suffix}.json")
     with open(out_path, "w") as fp:
@@ -275,6 +393,7 @@ def evaluate_mode(
     print(f"{mode:8} →", {k: round(v, 4) if isinstance(v, float) else '…' for k, v in metrics.items()},
           f"(saved → {out_path})")
     return metrics
+    
 # def evaluate_mode(
 #     mode       : str,
 #     dataset,

@@ -470,3 +470,53 @@ class HNN(nn.Module):
         # `create_graph=True` keeps higher-order grads for HNN loss
         dF2 = torch.autograd.grad(F2.sum(), qp, create_graph=True)[0]
         return dF2 @ self.J.T                              # matrix product
+
+class ThetaHead(nn.Module):
+    """Single-frame θ head; outputs normalized θ (mean≈0, std≈1)."""
+    def __init__(self, d, hidden=None):
+        super().__init__()
+        h = hidden or (d // 2)
+        self.net = nn.Sequential(
+            nn.Linear(d, h), nn.GELU(),
+            nn.Linear(h, 1)
+        )
+    def forward(self, z_t):  # z_t: (B, D) or (B, T, D)
+        if z_t.dim() == 3:
+            B, T, D = z_t.shape
+            y = self.net(z_t.reshape(B*T, D)).reshape(B, T, 1)
+        else:
+            y = self.net(z_t).unsqueeze(-1)  # (B,1)
+        return y  # normalized θ
+        
+
+class OmegaHead(nn.Module):
+    def __init__(self, d, hidden=None):
+        super().__init__()
+        h = hidden or (2*d)
+        in_dim = 3*d
+        self.norm_z  = nn.LayerNorm(d)
+        self.norm_zm = nn.LayerNorm(d)
+        self.norm_dz = nn.LayerNorm(d)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, h), nn.GELU(),
+            nn.Linear(h, h//2),   nn.GELU(),
+            nn.Linear(h//2, 1)
+        )
+
+    def forward(self, z_t, z_tm1, dt):
+        # remember original rank BEFORE any reshape
+        seq_mode = (z_t.dim() == 3)
+        if seq_mode:
+            B, Tp, D = z_t.shape
+            z_t   = z_t.reshape(B*Tp, D)
+            z_tm1 = z_tm1.reshape(B*Tp, D)
+
+        dz = (z_t - z_tm1) / dt
+        x = torch.cat([self.norm_z(z_t),
+                       self.norm_zm(z_tm1),
+                       self.norm_dz(dz)], dim=-1)
+        y = self.mlp(x)  # (B*Tp,1) or (B,1)
+
+        if seq_mode:
+            y = y.reshape(B, Tp, 1)  # (B, T-1, 1)
+        return y

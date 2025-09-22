@@ -639,9 +639,10 @@ def rollout_sim_better(
 @torch.no_grad()
 def rollout_align_with_goal(
     vjepa,
-    head,
+    theta_head,                      # NEW: single-frame θ head (outputs normalized θ)
+    omega_head,                      # NEW: two-frame ω head (outputs normalized ω)
     *,
-    eval_loader,                   # (B, T, C,H,W)
+    eval_loader,                     # yields (B, T, C, H, W)
     horizon   : int,
     dt        : float,
     hnn       = None,
@@ -650,28 +651,41 @@ def rollout_align_with_goal(
     device    = None,
     integrator: str = "verlet",
     context_mode: Optional[str] = None,    # None | "t0" | "perframe"
+    # NEW: de/normalization stats for outputs
+    theta_mu: float = 0.0,
+    theta_std: float = 1.0,
+    omega_mu: float = 0.0,
+    omega_std: float = 1.0,
+    # Optional hook to pre-normalize (q,v) before feeding physics nets
     normalize: Optional[callable] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns:
-      θ_img  : (N, T)   per-frame predictions from images
-      ω_img  : (N, T)
-      θ_roll : (N, T)   physics rollout from t=0 using (θ_img[:,0], ω_img[:,0])
+      θ_img  : (N, T)   per-frame predictions from images (de-normalized)
+      ω_img  : (N, T)   per-frame predictions; t=0 is filled (see below)
+      θ_roll : (N, T)   physics rollout from t=0 using (θ_img[:,0], ω0_init)
       ω_roll : (N, T)
       α_roll : (N, T)
+
+    Notes
+    -----
+    • ω_img at t=0 is not directly predictable by a two-frame head.
+      We use ω_img[:,1] as ω0_init for rollout when available; otherwise 0.
+      For the returned ω_img[:,0], we set it to ω0_init for convenience.
     """
     θ_img_buf, ω_img_buf = [], []
     θ_roll_buf, ω_roll_buf, α_roll_buf = [], [], []
 
-    # Reuse the accel and integrator from rollout_sim_better
+    # ---------------- accel helpers (same semantics as before) ----------------
     def _hnn_accel(hnn, q, v, z_ctx=None):
         x = torch.stack([q.reshape(-1), v.reshape(-1)], dim=1).requires_grad_(True)
         td = hnn.time_derivative(x)
-        return (td[:,1] if (td.ndim==2 and td.size(-1)>=2) else td.reshape(-1))
+        return (td[:, 1] if (td.ndim == 2 and td.size(-1) >= 2) else td.reshape(-1))
 
     def _lnn_accel(lnn, q, v, z_ctx=None):
-        return lnn_accel(lnn, q, v, dt=dt)
+        return lnn_accel(lnn, q, v, dt=dt)  # provided by your helper_functions
 
+    # fuse-picker
     if combine is None:
         picker = "hnn" if hnn is not None else "lnn"
     elif combine in {"hnn", "lnn", "mean", "sum"}:
@@ -692,14 +706,14 @@ def rollout_align_with_goal(
                 return _lnn_accel(lnn, q, v, z_ctx)
         if (picker == "mean") and (hnn is not None) and (lnn is not None):
             with torch.set_grad_enabled(True):
-                return 0.5*(_hnn_accel(hnn, q, v, z_ctx) + _lnn_accel(lnn, q, v, z_ctx))
+                return 0.5 * (_hnn_accel(hnn, q, v, z_ctx) + _lnn_accel(lnn, q, v, z_ctx))
         if (picker == "sum") and (hnn is not None) and (lnn is not None):
             with torch.set_grad_enabled(True):
                 return _hnn_accel(hnn, q, v, z_ctx) + _lnn_accel(lnn, q, v, z_ctx)
         if isinstance(picker, tuple) and picker[0] == "blend" and (hnn is not None) and (lnn is not None):
             w = float(picker[1])
             with torch.set_grad_enabled(True):
-                return w*_hnn_accel(hnn, q, v, z_ctx) + (1.0-w)*_lnn_accel(lnn, q, v, z_ctx)
+                return w * _hnn_accel(hnn, q, v, z_ctx) + (1.0 - w) * _lnn_accel(lnn, q, v, z_ctx)
         if hnn is not None:
             with torch.set_grad_enabled(True):
                 return _hnn_accel(hnn, q, v, z_ctx)
@@ -708,68 +722,90 @@ def rollout_align_with_goal(
                 return _lnn_accel(lnn, q, v, z_ctx)
         return torch.zeros_like(v)
 
-    # Modes
-    vjepa.eval(); head.eval()
+    # ---------------- eval modes & device ----------------
+    vjepa.eval(); theta_head.eval()
+    if hasattr(omega_head, "eval"): omega_head.eval()
     if hnn: hnn.eval()
     if lnn: lnn.eval()
     if device is None:
-        device = next(head.parameters()).device
+        # place on the same device as theta_head by default
+        device = next(theta_head.parameters()).device
 
+    # ---------------- main loop over batches ----------------
     for seq, *_ in tqdm.tqdm(eval_loader, desc="rollout_align_with_goal", leave=False):
-        seq = seq.to(device)
+        seq = seq.to(device)                # (B,T,C,H,W)
         B, T = seq.shape[0], min(seq.shape[1], horizon)
+        C, H, W = seq.shape[2], seq.shape[3], seq.shape[4]
 
-        # Per-frame image→latent predictions
-        θ_list, ω_list, Z = [], [], []
-        for t in range(T):
-            z_t = vjepa.context_encoder(vjepa.patch_embed(seq[:, t]) + vjepa.pos_embed).mean(1)
-            θ_t, ω_t = head(z_t).split(1, dim=1)
-            θ_list.append(θ_t.squeeze(1))
-            ω_list.append(ω_t.squeeze(1))
-            Z.append(z_t)
-        θ_img = torch.stack(θ_list, dim=1)     # (B,T)
-        ω_img = torch.stack(ω_list, dim=1)     # (B,T)
-        Z = torch.stack(Z, dim=1)              # (B,T,D)
+        # ---------- encode ALL frames once → z: (B,T,D) ----------
+        imgs_flat = seq[:, :T].reshape(B*T, C, H, W)
+        z_flat = vjepa.context_encoder(vjepa.patch_embed(imgs_flat) + vjepa.pos_embed).mean(1)
+        z = z_flat.reshape(B, T, -1)    # (B,T,D)
 
-        # Physics rollout from t=0
-        q = θ_img[:, 0].clone()
-        v = ω_img[:, 0].clone()
+        # ---------- θ predictions (normalized) for all frames ----------
+        θ_pn = theta_head(z)                 # (B,T,1), normalized
+        θ_img = (θ_pn * theta_std + theta_mu).squeeze(-1)  # (B,T)
+
+        # ---------- ω predictions (normalized) for frames 1..T-1 ----------
+        ω_img = torch.zeros(B, T, device=device)          # will fill t>=1
+        if T >= 2:
+            ω_pn = omega_head(z[:, 1:, :], z[:, :-1, :], dt)   # (B,T-1,1), normalized
+            ω_denorm = (ω_pn * omega_std + omega_mu).squeeze(-1)  # (B,T-1)
+            ω_img[:, 1:] = ω_denorm
+            # fill t=0 for convenience: use t=1 estimate as ω0_init (common eval trick)
+            ω_img[:, 0] = ω_denorm[:, 0]
+        # else: keep zeros
+
+        # Keep a copy of latents as rollout context if requested
+        Z = z  # (B,T,D)
+
+        # ---------- physics rollout from t=0 ----------
+        q = θ_img[:, 0].clone()                         # (B,)
+        # prefer two-frame ω at t=1; fallback to 0
+        v = (ω_img[:, 1].clone() if T >= 2 else torch.zeros_like(q))
+
         Θ, Ω, Α = [q], [v], []
-        # choose context
+
+        # choose initial context
         if context_mode == "t0":
             z_ctx0 = Z[:, 0]
         elif context_mode == "perframe":
             z_ctx0 = Z[:, 0]
         else:
             z_ctx0 = None
+
         a = _accel(q.detach(), v.detach(), z_ctx0)
 
         for t in range(T-1):
             if integrator == "euler":
-                q_next = q + v*dt
-                v_next = v + a*dt
-                z_ctx = (Z[:, t+1] if context_mode in ("t0","perframe") else None)
-                a_next = _accel(q_next.detach(), v_next.detach(), (Z[:, 0] if context_mode=="t0" else z_ctx))
+                q_next = q + v * dt
+                v_next = v + a * dt
+                z_ctx = (Z[:, t+1] if context_mode in ("t0", "perframe") else None)
+                a_next = _accel(q_next.detach(), v_next.detach(), (Z[:, 0] if context_mode == "t0" else z_ctx))
             else:
-                q_next = q + v*dt + 0.5*a*(dt**2)
-                v_half = v + 0.5*a*dt
-                z_ctx = (Z[:, t+1] if context_mode in ("t0","perframe") else None)
-                a_next = _accel(q_next.detach(), v_half.detach(), (Z[:, 0] if context_mode=="t0" else z_ctx))
-                v_next = v_half + 0.5*a_next*dt
+                # semi-implicit / Verlet-like step
+                q_next = q + v * dt + 0.5 * a * (dt ** 2)
+                v_half = v + 0.5 * a * dt
+                z_ctx = (Z[:, t+1] if context_mode in ("t0", "perframe") else None)
+                a_next = _accel(q_next.detach(), v_half.detach(), (Z[:, 0] if context_mode == "t0" else z_ctx))
+                v_next = v_half + 0.5 * a_next * dt
 
             Θ.append(q_next); Ω.append(v_next); Α.append(a)
             q, v, a = q_next, v_next, a_next
 
-        Α = [torch.zeros_like(Α[0])] + Α
+        Α = [torch.zeros_like(Ω[0])] + Α
+
+        # ---------- stash batch results on CPU ----------
         θ_img_buf.append(θ_img.cpu())
         ω_img_buf.append(ω_img.cpu())
         θ_roll_buf.append(torch.stack(Θ, 1).cpu())
         ω_roll_buf.append(torch.stack(Ω, 1).cpu())
         α_roll_buf.append(torch.stack(Α, 1).cpu())
 
-    θ_img_all = torch.cat(θ_img_buf, 0)
-    ω_img_all = torch.cat(ω_img_buf, 0)
-    θ_roll_all = torch.cat(θ_roll_buf, 0)
-    ω_roll_all = torch.cat(ω_roll_buf, 0)
-    α_roll_all = torch.cat(α_roll_buf, 0)
+    # ---------------- concat over batches ----------------
+    θ_img_all  = torch.cat(θ_img_buf,  0)  # (N,T)
+    ω_img_all  = torch.cat(ω_img_buf,  0)  # (N,T)
+    θ_roll_all = torch.cat(θ_roll_buf, 0)  # (N,T)
+    ω_roll_all = torch.cat(ω_roll_buf, 0)  # (N,T)
+    α_roll_all = torch.cat(α_roll_buf, 0)  # (N,T)
     return θ_img_all, ω_img_all, θ_roll_all, ω_roll_all, α_roll_all

@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # project-local
-from utils.models   import VJEPA, HNN, LNN
+from utils.models   import *
 from utils.datasets import PendulumDataset
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -57,7 +57,15 @@ class TrainConfig:
     λ_lnn      : float = 0.0
     λ_theta    : float = 1e-2
     λ_omega    : float = 1e-2
-    bal_mult   : float = 3.2
+
+    # NEW: rollout/frame spacing for Δz
+    dt         : float = 0.05
+
+    # NEW: target normalization stats (fill these from your stats)
+    theta_mu   : float = 0.0
+    theta_std  : float = 1.0
+    omega_mu   : float = 0.0
+    omega_std  : float = 1.0
 
     suffix     : str   = "_dense"
     model_dir  : str   = "./models"
@@ -79,48 +87,86 @@ class TrainConfig:
 # ====================================================================
 def train_one_epoch(
     model: VJEPA,
-    theta_head: nn.Linear,
+    theta_head: nn.Module,
+    omega_head: nn.Module,
     lnn: Optional[LNN],
     hnn: Optional[HNN],
     loader: DataLoader,
     opt: optim.Optimizer,
+    *,
     λ_lnn: float,
     λ_hnn: float,
-    λ_theta: float
-    λ_omega: float
-    bal_mult: float
+    λ_theta: float,
+    λ_omega: float,
+    dt: float,
+    theta_mu: float, theta_std: float,
+    omega_mu: float, omega_std: float,
 ) -> Dict[str,float]:
 
-    model.train(); theta_head.train()
+    model.train(); theta_head.train(); omega_head.train()
     if lnn: lnn.train()
     if hnn: hnn.train()
 
     agg = dict(jepa=0., lnn=0., hnn=0., sup=0., total=0.)
 
     for imgs_seq, states_seq in loader:
-        imgs_seq, states_seq = imgs_seq.to(device), states_seq.to(device)
-        imgs0  = imgs_seq[:,0]
-        θ_true = states_seq[:,:,0:1]
-        ω_true = states_seq[:,:,1:2]
+        imgs_seq, states_seq = imgs_seq.to(device), states_seq.to(device)  # (B,T,C,H,W), (B,T,2)
+        B, T = imgs_seq.size(0), imgs_seq.size(1)
 
+        # --- JEPA reconstruction on current frame (keep your behaviour)
+        imgs0 = imgs_seq[:, 0]
         loss_jepa, _, _ = model(imgs0)
 
-        z0 = model.patch_embed(imgs0) + model.pos_embed
-        z0 = model.context_encoder(z0).mean(1)
-        θ̂0, ω̂0 = theta_head(z0).split(1,1)
+        # --- Encode ALL frames to latents z: (B,T,D)
+        C, H, W = imgs_seq.size(2), imgs_seq.size(3), imgs_seq.size(4)
+        imgs_flat = imgs_seq.reshape(B*T, C, H, W)
+        z_flat = model.context_encoder(model.patch_embed(imgs_flat) + model.pos_embed).mean(1)
+        z = z_flat.reshape(B, T, -1)  # (B,T,D)
 
+        # --- Targets
+        θ_true = states_seq[:, :, 0:1]  # (B,T,1)
+        ω_true = states_seq[:, :, 1:2]  # (B,T,1)
+
+        # --- Normalize targets
+        θ_tn = (θ_true - theta_mu) / (theta_std + 1e-8)  # (B,T,1)
+        ω_tn = (ω_true - omega_mu) / (omega_std + 1e-8)  # (B,T,1)
+
+        # --- θ predictions for all frames (normalized output)
+        θ_pn = theta_head(z)           # (B,T,1)
+
+        # --- ω predictions for frames 1..T-1 using (z_t, z_{t-1}, Δz)
+        if T >= 2:
+            z_tm1 = z[:, :-1, :]      # (B,T-1,D)
+            z_t   = z[:, 1:,  :]      # (B,T-1,D)
+            ω_pn  = omega_head(z_t, z_tm1, dt)   # (B,T-1,1)
+            ω_tn_ = ω_tn[:, 1:, :]                # (B,T-1,1)
+            omega_loss = F.mse_loss(ω_pn, ω_tn_)
+        else:
+            omega_loss = torch.tensor(0., device=device)
+
+        theta_loss = F.mse_loss(θ_pn, θ_tn)
+
+        sup_loss   = λ_theta * theta_loss + λ_omega * omega_loss
+
+        # --- Optional physics losses (left as-is; keep simple)
         hnn_loss = torch.tensor(0., device=device)
-        if hnn and λ_hnn>0:
-            hnn_loss = F.mse_loss(hnn.time_derivative(torch.cat([θ̂0, ω̂0],1))[:,0:1], ω̂0)
+        if hnn and λ_hnn > 0:
+            # use frame 0 preds (denormed) to form qp for HNN toy loss
+            θ0 = (θ_pn[:, 0, :] * (theta_std + 1e-8) + theta_mu)
+            if T >= 2:
+                ω0 = (ω_pn[:, 0, :] * (omega_std + 1e-8) + omega_mu)  # from t=1 pair
+            else:
+                ω0 = (θ_pn[:, 0, :] * 0.0)  # no ω; harmless
+            qp = torch.cat([θ0, ω0], dim=1)  # (B,2)
+            td = hnn.time_derivative(qp.requires_grad_(True))
+            a = td[:, 1] if (td.ndim == 2 and td.size(-1) >= 2) else td.reshape(-1, 1)
+            hnn_loss = F.mse_loss(hnn.time_derivative(torch.cat([θ̂0, ω̂0],1))[:,0:1], ω̂0)  # placeholder/no-op if you don't have a proper HNN loss here
 
         lnn_loss = torch.tensor(0., device=device)
-        if lnn and λ_lnn>0:
+        if lnn and λ_lnn > 0:
             lnn_loss = lnn.lagrangian_residual(θ_true, ω_true)
 
-        theta_loss = F.mse_loss(θ̂0, θ_true[:,0])
-        omega_loss = F.mse_loss(ω̂0, ω_true[:,0])
-        sup_loss   = bal_mult(λ_theta*theta_loss + λ_omega*omega_loss)
-
+        # --- Total
         loss = loss_jepa + λ_lnn*lnn_loss + λ_hnn*hnn_loss + sup_loss
 
         opt.zero_grad(); loss.backward(); opt.step()
@@ -149,45 +195,56 @@ def run_mode(cfg: TrainConfig, dataloader: DataLoader) -> None:
                   depth=cfg.depth,
                   num_heads=cfg.num_heads).to(device)
 
-    theta_head = nn.Linear(cfg.embed_dim, 2).to(device)
-    hnn = HNN(cfg.h_hidden).to(device) if cfg.λ_hnn>0 else None
-    lnn = LNN(2, cfg.l_hidden).to(device) if cfg.λ_lnn>0 else None
+    theta_head = ThetaHead(cfg.embed_dim).to(device)
+    omega_head = OmegaHead(cfg.embed_dim).to(device)
+
+    hnn = HNN(cfg.h_hidden).to(device) if cfg.λ_hnn > 0 else None
+    lnn = LNN(2, cfg.l_hidden).to(device) if cfg.λ_lnn > 0 else None
 
     opt = optim.AdamW(
         list(model.parameters())
         + list(theta_head.parameters())
+        + list(omega_head.parameters())
         + ([] if hnn is None else list(hnn.parameters()))
         + ([] if lnn is None else list(lnn.parameters())),
-        lr=cfg.lr)
+        lr=cfg.lr
+    )
 
     rows: List[Dict[str,float]] = []
     for ep in range(cfg.epochs):
-        loss_d = train_one_epoch(model, theta_head,
-                                 lnn, hnn, dataloader, opt,
-                                 cfg.λ_lnn, cfg.λ_hnn, cfg.λ_theta, cfg.λ_omega, cfg.λ_bal_mult)
+        loss_d = train_one_epoch(
+            model, theta_head, omega_head, lnn, hnn,
+            dataloader, opt,
+            λ_lnn=cfg.λ_lnn, λ_hnn=cfg.λ_hnn,
+            λ_theta=cfg.λ_theta, λ_omega=cfg.λ_omega,
+            dt=cfg.dt,
+            theta_mu=cfg.theta_mu, theta_std=cfg.theta_std,
+            omega_mu=cfg.omega_mu, omega_std=cfg.omega_std
+        )
         rows.append({"epoch": ep+1, **loss_d})
-        print(f"ep{ep+1:02d}",
-              " ".join([f"{k}={v:.3f}" for k,v in loss_d.items()]))
+        print(f"ep{ep+1:02d}", " ".join([f"{k}={v:.3f}" for k,v in loss_d.items()]))
 
-    ckpt = {f"vjepa.{k}":v.cpu() for k,v in model.state_dict().items()}
-    ckpt.update({f"theta_head.{k}":v.cpu() for k,v in theta_head.state_dict().items()})
-    if hnn: ckpt.update({f"hnn.{k}":v.cpu() for k,v in hnn.state_dict().items()})
-    if lnn: ckpt.update({f"lnn.{k}":v.cpu() for k,v in lnn.state_dict().items()})
+    # --- Save
+    ckpt = {f"vjepa.{k}": v.cpu() for k,v in model.state_dict().items()}
+    ckpt.update({f"theta_head.{k}": v.cpu() for k,v in theta_head.state_dict().items()})
+    ckpt.update({f"omega_head.{k}": v.cpu() for k,v in omega_head.state_dict().items()})
+    if hnn: ckpt.update({f"hnn.{k}": v.cpu() for k,v in hnn.state_dict().items()})
+    if lnn: ckpt.update({f"lnn.{k}": v.cpu() for k,v in lnn.state_dict().items()})
 
     torch.save(ckpt, os.path.join(cfg.model_dir, f"model_{cfg.mode}{cfg.suffix}.pt"))
 
+    # --- Logs (unchanged)
     csv_path = os.path.join(cfg.log_dir, f"train_{cfg.mode}{cfg.suffix}.csv")
     with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
+        import csv
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys()); writer.writeheader(); writer.writerows(rows)
 
     np.savez(os.path.join(cfg.log_dir, f"results_{cfg.mode}{cfg.suffix}.npz"),
              loss_total=np.array([r["total"] for r in rows]),
              loss_jepa =np.array([r["jepa"]  for r in rows]),
              loss_hnn  =np.array([r["hnn"]   for r in rows]),
              loss_lnn  =np.array([r["lnn"]   for r in rows]),
-             loss_sup  =np.array([r["sup"]   for r in rows]),)
+             loss_sup  =np.array([r["sup"]   for r in rows]))
     
 def run_all_modes(modes: list[str],
                   dl: DataLoader,
