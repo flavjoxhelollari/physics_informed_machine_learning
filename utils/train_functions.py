@@ -55,7 +55,9 @@ class TrainConfig:
 
     λ_hnn      : float = 0.0
     λ_lnn      : float = 0.0
-    λ_sup      : float = 1e-2
+    λ_theta    : float = 1e-2
+    λ_omega    : float = 1e-2
+    bal_mult   : float = 3.2
 
     suffix     : str   = "_dense"
     model_dir  : str   = "./models"
@@ -84,7 +86,9 @@ def train_one_epoch(
     opt: optim.Optimizer,
     λ_lnn: float,
     λ_hnn: float,
-    λ_sup: float
+    λ_theta: float
+    λ_omega: float
+    bal_mult: float
 ) -> Dict[str,float]:
 
     model.train(); theta_head.train()
@@ -113,9 +117,11 @@ def train_one_epoch(
         if lnn and λ_lnn>0:
             lnn_loss = lnn.lagrangian_residual(θ_true, ω_true)
 
-        sup_loss = F.mse_loss(θ̂0, θ_true[:,0])
+        theta_loss = F.mse_loss(θ̂0, θ_true[:,0])
+        omega_loss = F.mse_loss(ω̂0, ω_true[:,0])
+        sup_loss   = bal_mult(λ_theta*theta_loss + λ_omega*omega_loss)
 
-        loss = loss_jepa + λ_lnn*lnn_loss + λ_hnn*hnn_loss + λ_sup*sup_loss
+        loss = loss_jepa + λ_lnn*lnn_loss + λ_hnn*hnn_loss + sup_loss
 
         opt.zero_grad(); loss.backward(); opt.step()
 
@@ -158,7 +164,7 @@ def run_mode(cfg: TrainConfig, dataloader: DataLoader) -> None:
     for ep in range(cfg.epochs):
         loss_d = train_one_epoch(model, theta_head,
                                  lnn, hnn, dataloader, opt,
-                                 cfg.λ_lnn, cfg.λ_hnn, cfg.λ_sup)
+                                 cfg.λ_lnn, cfg.λ_hnn, cfg.λ_theta, cfg.λ_omega, cfg.λ_bal_mult)
         rows.append({"epoch": ep+1, **loss_d})
         print(f"ep{ep+1:02d}",
               " ".join([f"{k}={v:.3f}" for k,v in loss_d.items()]))
