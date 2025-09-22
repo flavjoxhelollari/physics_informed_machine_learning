@@ -250,3 +250,100 @@ class PendulumDataset(Dataset):
             imgs = self.transform(imgs)
 
         return imgs, states
+
+import math
+from typing import Dict, Optional, Union
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+@torch.no_grad()
+def compute_theta_omega_stats(
+    data: Union[DataLoader, torch.utils.data.Dataset],
+    *,
+    batch_size: int = 512,         # used if `data` is a Dataset
+    use_all_timesteps: bool = True, # True = use all frames in the window; False = only t=0
+    max_samples: Optional[int] = None, # cap total frames considered (for speed)
+    device: Optional[torch.device] = None,
+    theta_wrap: bool = True         # if True, also report circular mean/std for θ
+) -> Dict[str, Dict[str, float]]:
+    """
+    Scans the dataset/loader and returns summary stats for θ and ω.
+
+    Returns a dict with keys 'theta' and 'omega', each containing:
+      - count, mean, std, min, max, p01, p50, p99
+      - (for theta) circ_mean, circ_std if theta_wrap=True
+
+    Assumptions:
+      dataset __getitem__ returns (seq, states) with states shape (T, 2)
+      where states[...,0] = theta, states[...,1] = omega.
+    """
+    # Get a DataLoader either way
+    if isinstance(data, DataLoader):
+        loader = data
+    else:
+        loader = DataLoader(data, batch_size=batch_size, shuffle=False)
+
+    theta_vals = []
+    omega_vals = []
+    seen = 0
+
+    for batch in loader:
+        # supports datasets that return (seq, states) or (seq, states, ...)
+        seq, states = batch[0], batch[1]     # states: (B, T, 2)
+        states = states if device is None else states.to(device)
+
+        if use_all_timesteps:
+            θ = states[..., 0].reshape(-1)   # (B*T,)
+            ω = states[..., 1].reshape(-1)
+        else:
+            θ = states[:, 0, 0].reshape(-1)  # (B,)
+            ω = states[:, 0, 1].reshape(-1)
+
+        theta_vals.append(θ.cpu())
+        omega_vals.append(ω.cpu())
+
+        seen += θ.numel()
+        if (max_samples is not None) and (seen >= max_samples):
+            break
+
+    if not theta_vals:
+        raise ValueError("No data found to compute stats.")
+
+    θ_all = torch.cat(theta_vals)
+    ω_all = torch.cat(omega_vals)
+
+    if max_samples is not None and θ_all.numel() > max_samples:
+        θ_all = θ_all[:max_samples]
+        ω_all = ω_all[:max_samples]
+
+    def _tensor_stats(x: torch.Tensor) -> Dict[str, float]:
+        x_np = x.numpy()
+        return dict(
+            count       = float(x_np.size),
+            mean        = float(np.mean(x_np)),
+            std         = float(np.std(x_np, ddof=0)),
+            min         = float(np.min(x_np)),
+            p01         = float(np.percentile(x_np, 1)),
+            p50         = float(np.percentile(x_np, 50)),
+            p99         = float(np.percentile(x_np, 99)),
+            max         = float(np.max(x_np)),
+        )
+
+    def _circular_stats(x: torch.Tensor) -> Dict[str, float]:
+        # x in radians; computes circular mean and std
+        x_np = x.numpy()
+        s, c = np.sin(x_np), np.cos(x_np)
+        mean_ang = math.atan2(np.mean(s), np.mean(c))  # in [-pi, pi]
+        R = np.hypot(np.mean(c), np.mean(s))           # mean resultant length
+        # circular std: sqrt(-2 ln R)  (Fisher 1993)
+        circ_std = float(np.sqrt(max(0.0, -2.0 * np.log(max(R, 1e-12)))))
+        return dict(circ_mean=float(mean_ang), circ_std=circ_std, R=float(R))
+
+    theta_stats = _tensor_stats(θ_all)
+    omega_stats = _tensor_stats(ω_all)
+
+    if theta_wrap:
+        theta_stats.update(_circular_stats(θ_all))
+
+    return {"theta": theta_stats, "omega": omega_stats}
